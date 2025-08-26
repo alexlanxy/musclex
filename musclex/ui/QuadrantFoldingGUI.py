@@ -359,6 +359,10 @@ class QuadrantFoldingGUI(QMainWindow):
         self.showSeparator.setText("Show Quadrant Separator")
         self.showSeparator.setChecked(True)
 
+        self.invertImageChkBx = QCheckBox("Invert Image")
+        self.invertImageChkBx.setChecked(False)
+        
+
         self.imgZoomInB = QPushButton("Zoom in")
         self.imgZoomInB.setCheckable(True)
         self.imgZoomOutB = QPushButton("Full")
@@ -372,16 +376,17 @@ class QuadrantFoldingGUI(QMainWindow):
         self.cropFoldedImageChkBx.setChecked(False)
 
         self.dispOptLayout.addWidget(self.showSeparator, 0, 0, 1, 4)
-        self.dispOptLayout.addWidget(self.minIntLabel, 1, 0, 1, 2)
-        self.dispOptLayout.addWidget(self.spminInt, 2, 0, 1, 2)
-        self.dispOptLayout.addWidget(self.maxIntLabel, 1, 2, 1, 2)
-        self.dispOptLayout.addWidget(self.spmaxInt, 2, 2, 1, 2)
-        self.dispOptLayout.addWidget(self.logScaleIntChkBx, 3, 0, 1, 2)
-        self.dispOptLayout.addWidget(self.persistIntensity, 3, 2, 1, 2)
-        self.dispOptLayout.addWidget(self.imgZoomInB, 4, 0, 1, 2)
-        self.dispOptLayout.addWidget(self.imgZoomOutB, 4, 2, 1, 2)
-        self.dispOptLayout.addWidget(self.doubleZoom, 5, 0, 1, 2)
-        self.dispOptLayout.addWidget(self.cropFoldedImageChkBx, 5, 2, 1, 2)
+        self.dispOptLayout.addWidget(self.invertImageChkBx, 1, 0, 1, 4)  # ADD THIS LINE
+        self.dispOptLayout.addWidget(self.minIntLabel, 2, 0, 1, 2)        # Changed from row 1 to 2
+        self.dispOptLayout.addWidget(self.spminInt, 3, 0, 1, 2)          # Changed from row 2 to 3
+        self.dispOptLayout.addWidget(self.maxIntLabel, 2, 2, 1, 2)       # Changed from row 1 to 2
+        self.dispOptLayout.addWidget(self.spmaxInt, 3, 2, 1, 2)          # Changed from row 2 to 3
+        self.dispOptLayout.addWidget(self.logScaleIntChkBx, 4, 0, 1, 2)  # Changed from row 3 to 4
+        self.dispOptLayout.addWidget(self.persistIntensity, 4, 2, 1, 2)  # Changed from row 3 to 4
+        self.dispOptLayout.addWidget(self.imgZoomInB, 5, 0, 1, 2)        # Changed from row 4 to 5
+        self.dispOptLayout.addWidget(self.imgZoomOutB, 5, 2, 1, 2)       # Changed from row 4 to 5
+        self.dispOptLayout.addWidget(self.doubleZoom, 6, 0, 1, 2)        # Changed from row 5 to 6
+        self.dispOptLayout.addWidget(self.cropFoldedImageChkBx, 6, 2, 1, 2)  # Changed from row 5 to 6
 
         self.rightImageLayout.addWidget(self.displayOptGrpBx)
         self.rightImageLayout.addSpacing(10)
@@ -1155,6 +1160,7 @@ class QuadrantFoldingGUI(QMainWindow):
         self.spmaxInt.valueChanged.connect(self.refreshImageTab)
         self.logScaleIntChkBx.stateChanged.connect(self.refreshImageTab)
         self.showSeparator.stateChanged.connect(self.refreshAllTabs)
+        self.invertImageChkBx.stateChanged.connect(self.inversionChanged)
         self.orientationCmbBx.currentIndexChanged.connect(self.orientationModelChanged)
         self.processFolderButton.toggled.connect(self.batchProcBtnToggled)
         self.processFolderButton2.toggled.connect(self.batchProcBtnToggled)
@@ -2830,6 +2836,22 @@ class QuadrantFoldingGUI(QMainWindow):
             self.processImage()
 
         self.highlightApplyUndo()
+    
+    def inversionChanged(self):
+        """
+        Trigger when inversion is changed
+        """
+        img = self.quadFold.orig_img
+
+        if not self.persistIntensity.isChecked():
+            minInt = img.min() + img.max() - self.spmaxInt.value()
+            maxInt = img.min() + img.max() - self.spminInt.value()
+
+            self.spminInt.setValue(minInt)
+            self.spmaxInt.setValue(maxInt)
+
+
+        self.refreshImageTab()
 
     def minIntChanged(self):
         """
@@ -3207,6 +3229,12 @@ class QuadrantFoldingGUI(QMainWindow):
             img = self.quadFold.getRotatedImage()
             self.img = img
             img = self.quadFold.orig_img
+
+            if self.invertImageChkBx.isChecked():
+                img_max = img.max()
+                img_min = img.min()
+                img = img_max + img_min - img
+
 
             extent = [0,0]
             center = self.quadFold.info['center']
