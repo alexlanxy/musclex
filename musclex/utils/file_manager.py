@@ -85,94 +85,105 @@ def getMaskOnly(path):
 
 def getImgFiles(fullname, headless=False):
     """
-    Get directory, all image file names in the same directory and current file index
-    :param fullname: full name of the file including directory i.e. /aaa/bbb/ccc/ddd.tif (str)
-    :return: directory (str), list of image file names, and current index i.e /aaa/bbb/ccc, ["ddd.tif","eee.tif"], 0
+    Get directory, all image-like entries in the same directory and current file index.
+    Directory may contain TIFFs, single-image HDF5, and multi-image HDF5.
+    Returns a unified list of display names and a parallel list of lazy loader specs.
+    :param fullname: absolute path to a file selected by user
+    :return: (dir_path, imgList, current, fileList, ext)
+             - dir_path: directory string
+             - imgList: sorted list of display names (strings)
+             - current: index of the selected entry in imgList
+             - fileList: [imgList, loader_specs]
+                   loader_specs contains tuples describing how to load on demand:
+                     ("tiff", abs_path)
+                     ("h5", abs_path, frame_index)
+             - ext: '.mixed' to indicate unified mixed-mode
     """
-    dir_path, filename = split(str(fullname)) # split directory and file name from full file name
+    dir_path, filename = split(str(fullname))
     dir_path = str(dir_path)
     filename = str(filename)
-    _, ext = os.path.splitext(str(filename))
-    current = 0
-    failedcases = []
-    filename_index = None
+    _, selected_ext = os.path.splitext(str(filename))
 
-    if ext == ".txt":
+    # Collect optional filter from a .txt list
+    failedcases = [] if selected_ext == ".txt" else None
+    if failedcases is not None:
         for line in open(fullname, "r"):
             failedcases.append(line.rstrip('\n'))
-    else:
-        failedcases = None
 
-    if ext in ('.hdf5', '.h5'):
-        fileList = loadFile(fullname)
-        imgList = []
-        if fileList is None or not fileList or None in fileList:
-            infMsg = QMessageBox()
-            infMsg.setText('Error opening file: ' + fullname)
-            infMsg.setInformativeText("File is not a valid HDF5 file or corrupted.")
-            infMsg.setStandardButtons(QMessageBox.Ok)
-            infMsg.setIcon(QMessageBox.Information)
-            infMsg.exec_()
-            return None, None, None, None, None
-        for f in fileList[0]:
-            if failedcases is not None and f not in failedcases:
-                continue
-            imgList.append(f)
-        if len(imgList) == 1 and not headless:
-            # if only one image in the h5 file, take all the single h5 images in the folder
-            infMsg = QMessageBox()
-            infMsg.setText('Single Image H5 File')
-            infMsg.setInformativeText("The H5 file selected contains only one image. All the H5 files in the current folder containing only one image will be regrouped the same way as a folder containing TIF files.\n")
-            infMsg.setStandardButtons(QMessageBox.Ok)
-            infMsg.setIcon(QMessageBox.Information)
-            infMsg.exec_()
-            list_h5_files = os.listdir(dir_path)
-            imgList = []
-            fileList = [[],[]]
-            for f in list_h5_files:
-                _, ext2 = os.path.splitext(str(f))
-                full_file_name = fullPath(dir_path, f)
-                if ext2 in ('.hdf5', '.h5'):
-                    file_loader = loadFile(full_file_name)
-                    if file_loader[0] is None:
-                        infMsg = QMessageBox()
-                        infMsg.setText('Error opening file: ' + f)
-                        infMsg.setInformativeText("File is not a valid HDF5 file, is corrupted, or is an empty HDF5 Master file.  Skipping.")
-                        infMsg.setStandardButtons(QMessageBox.Ok)
-                        infMsg.setIcon(QMessageBox.Information)
-                        infMsg.exec_()
-                        continue
-                    if len(file_loader[0]) == 1:
-                        if failedcases is not None and file_loader[0][0] not in failedcases:
-                            continue
-                        imgList.append(file_loader[0][0])
-                        fileList[0].append(file_loader[0][0])
-                        fileList[1].append(file_loader[1][0])
-                        if full_file_name == fullname:
-                            filename_index = file_loader[0][0]
-            imgList.sort()
-    else:
-        fileList = os.listdir(dir_path)
-        imgList = []
-        for f in fileList:
-            if failedcases is not None and f not in failedcases:
-                continue
-            full_file_name = fullPath(dir_path, f)
-            _, ext2 = os.path.splitext(str(f))
-            if isImg(full_file_name) and f != "calibration.tif" and ext2 not in ('.hdf5', '.h5'):  #and validateImage(full_file_name):
-                imgList.append(f)
-        imgList.sort()
+    # Build unified entries: list of (display_name, loader_spec)
+    entries = []
+    try:
+        dir_list = os.listdir(dir_path)
+    except Exception:
+        return None, None, None, None, None
 
-    if failedcases is None and imgList:
-        if ext in ('.hdf5', '.h5'):
-            if filename_index is None:
-                current = 0
+    for f in dir_list:
+        if failedcases is not None and f not in failedcases:
+            continue
+        full_file_name = fullPath(dir_path, f)
+        base, ext = os.path.splitext(f)
+
+        # Skip calibration artifact
+        if f == "calibration.tif":
+            continue
+
+        # Standard images (non-HDF5)
+        if isImg(full_file_name) and ext.lower() not in ('.hdf5', '.h5'):
+            entries.append((f, ("tiff", full_file_name)))
+            continue
+
+        # HDF5 images: enumerate frames lazily
+        if ext.lower() in ('.hdf5', '.h5'):
+            try:
+                fab = fabio.open(full_file_name)
+                nframes = getattr(fab, 'nframes', 1)
+                # Always create a pseudo-name per frame to unify stepping
+                if nframes <= 1:
+                    disp = f"{base}_00001{ext}"
+                    entries.append((disp, ("h5", full_file_name, 0)))
+                else:
+                    # enumerate all frames
+                    for i in range(nframes):
+                        disp = f"{base}_{i+1:05d}{ext}"
+                        entries.append((disp, ("h5", full_file_name, i)))
+            except Exception:
+                # Invalid/corrupt HDF5 → skip silently for fast stepping
+                continue
+            finally:
+                try:
+                    fab.close()
+                except Exception:
+                    pass
+
+    # Sort by display name for stable stepping
+    entries.sort(key=lambda x: x[0])
+
+    imgList = [name for name, _ in entries]
+    loader_specs = [spec for _, spec in entries]
+
+    # Determine current index based on the selected file
+    current = 0
+    if imgList:
+        if selected_ext.lower() in ('.hdf5', '.h5'):
+            # If user picked an HDF5, default to its first frame pseudo-name
+            base, ext = os.path.splitext(filename)
+            preferred = f"{base}_00001{ext}"
+            if preferred in imgList:
+                current = imgList.index(preferred)
             else:
-                current = imgList.index(filename_index)
+                # fallback: first entry with same base
+                same = [i for i, n in enumerate(imgList) if n.startswith(base + '_') and n.endswith(ext)]
+                current = same[0] if same else 0
         else:
-            current = imgList.index(filename)
-    
-    return dir_path, imgList, current, fileList, ext
+            # Plain images match by original file name
+            if filename in imgList:
+                current = imgList.index(filename)
+            else:
+                current = 0
+
+    # Return unified structure; ext is mixed to disable H5-only GUI affordances
+    fileList = [imgList, loader_specs]
+    return dir_path, imgList, current, fileList, '.mixed'
 
 def fullPath(filePath, fileName):
     """

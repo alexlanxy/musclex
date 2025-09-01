@@ -46,14 +46,68 @@ class XRayViewer:
         :param img_name: image file name
         """
         self.img_name = img_name
-        if extension in ('.hdf5', '.h5'):
-            index = next((i for i, item in enumerate(file_list[0]) if item == img_name), 0)
-            self.orig_img = file_list[1][index]
-        else:
+        # Locate corresponding loader spec by display name
+        selected_index = 0
+        if isinstance(file_list, list) and len(file_list) >= 2 and isinstance(file_list[0], list):
             try:
-                self.orig_img = fabio.open(fullPath(img_path, img_name)).data
-            except:
-                exit
+                selected_index = next((i for i, item in enumerate(file_list[0]) if item == img_name), 0)
+            except Exception:
+                selected_index = 0
+
+        source = None
+        if isinstance(file_list, list) and len(file_list) >= 2 and isinstance(file_list[1], list) and selected_index < len(file_list[1]):
+            source = file_list[1][selected_index]
+
+        # Lazy load based on loader spec
+        if isinstance(source, np.ndarray):
+            self.orig_img = source
+        elif isinstance(source, tuple):
+            # Tuple forms:
+            # ("tiff", abs_path) or ("h5", abs_path, frame_idx)
+            kind = source[0]
+            if kind == "tiff" and len(source) == 2:
+                try:
+                    self.orig_img = fabio.open(source[1]).data
+                except Exception:
+                    exit
+            elif kind == "h5" and len(source) == 3:
+                abs_path, frame_idx = source[1], int(source[2])
+                try:
+                    fab = fabio.open(abs_path)
+                    # Single frame fast path
+                    if getattr(fab, 'nframes', 1) == 1 or frame_idx == 0:
+                        data = fab.data if frame_idx == 0 else fab.get_frame(frame_idx).data
+                    else:
+                        frame = fab.get_frame(frame_idx)
+                        data = frame.data
+                    self.orig_img = data
+                except Exception:
+                    exit
+                finally:
+                    try:
+                        fab.close()
+                    except Exception:
+                        pass
+            else:
+                # Unexpected spec; fall back to direct open
+                try:
+                    self.orig_img = fabio.open(fullPath(img_path, img_name)).data
+                except Exception:
+                    exit
+        else:
+            # Backward compatibility: extension-based or direct
+            if extension in ('.hdf5', '.h5'):
+                try:
+                    # Old path used to pass ndarray in file_list[1]
+                    self.orig_img = source if source is not None else fabio.open(fullPath(img_path, img_name)).data
+                except Exception:
+                    exit
+            else:
+                try:
+                    self.orig_img = fabio.open(fullPath(img_path, img_name)).data
+                except Exception:
+                    exit
+
         self.orig_img = ifHdfReadConvertless(img_name, self.orig_img)
         self.orig_img = self.orig_img.astype("float32")
         self.orig_image_center = None
