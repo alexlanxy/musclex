@@ -4193,7 +4193,8 @@ class QuadrantFoldingGUI(QMainWindow):
         if self.numberOfFiles > 0:
             self.currentFileNumber = (self.currentFileNumber - 1) % self.numberOfFiles
 
-            self.quadFold = QuadrantFolder(self.filePath, self.fileList[self.currentFileNumber], self, self.fileList, self.ext)            
+            # Pass display name from imgList (fileList is now composite)
+            self.quadFold = QuadrantFolder(self.filePath, self.imgList[self.currentFileNumber], self, self.fileList, self.ext)
             self.quadFold.info = {}
             
             if self.calSettingsDialog.fixedCenter.isChecked():
@@ -4213,7 +4214,8 @@ class QuadrantFoldingGUI(QMainWindow):
         if self.numberOfFiles > 0:
             self.currentFileNumber = (self.currentFileNumber + 1) % self.numberOfFiles
 
-            self.quadFold = QuadrantFolder(self.filePath, self.fileList[self.currentFileNumber], self, self.fileList, self.ext)
+            # Pass display name from imgList (fileList is now composite)
+            self.quadFold = QuadrantFolder(self.filePath, self.imgList[self.currentFileNumber], self, self.fileList, self.ext)
             self.quadFold.info = {}
 
             if self.calSettingsDialog.fixedCenter.isChecked():
