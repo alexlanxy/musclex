@@ -33,6 +33,9 @@ import fabio
 #from ..ui.pyqt_utils import *
 from .hdf5_manager import loadFile
 from PySide6.QtWidgets import QMessageBox
+from concurrent.futures import ProcessPoolExecutor
+import hashlib
+import time
 
 input_types = ['adsc', 'cbf', 'edf', 'fit2d', 'mar345', 'marccd', 'hdf5', 'h5', 'pilatus', 'tif', 'tiff', 'smv']
 
@@ -110,56 +113,8 @@ def getImgFiles(fullname, headless=False):
         for line in open(fullname, "r"):
             failedcases.append(line.rstrip('\n'))
 
-    # Build unified entries: list of (display_name, loader_spec)
-    entries = []
-    try:
-        dir_list = os.listdir(dir_path)
-    except Exception:
-        return None, None, None, None, None
-
-    for f in dir_list:
-        if failedcases is not None and f not in failedcases:
-            continue
-        full_file_name = fullPath(dir_path, f)
-        base, ext = os.path.splitext(f)
-
-        # Skip calibration artifact
-        if f == "calibration.tif":
-            continue
-
-        # Standard images (non-HDF5)
-        if isImg(full_file_name) and ext.lower() not in ('.hdf5', '.h5'):
-            entries.append((f, ("tiff", full_file_name)))
-            continue
-
-        # HDF5 images: enumerate frames lazily
-        if ext.lower() in ('.hdf5', '.h5'):
-            try:
-                fab = fabio.open(full_file_name)
-                nframes = getattr(fab, 'nframes', 1)
-                # Always create a pseudo-name per frame to unify stepping
-                if nframes <= 1:
-                    disp = f"{base}_00001{ext}"
-                    entries.append((disp, ("h5", full_file_name, 0)))
-                else:
-                    # enumerate all frames
-                    for i in range(nframes):
-                        disp = f"{base}_{i+1:05d}{ext}"
-                        entries.append((disp, ("h5", full_file_name, i)))
-            except Exception:
-                # Invalid/corrupt HDF5 → skip silently for fast stepping
-                continue
-            finally:
-                try:
-                    fab.close()
-                except Exception:
-                    pass
-
-    # Sort by display name for stable stepping
-    entries.sort(key=lambda x: x[0])
-
-    imgList = [name for name, _ in entries]
-    loader_specs = [spec for _, spec in entries]
+    # Fast path: immediate imgList/specs from cache+parallel scan
+    imgList, loader_specs = scan_directory_images_cached(dir_path, failedcases)
 
     # Determine current index based on the selected file
     current = 0
@@ -250,3 +205,100 @@ def createFolder(path):
     """
     if not exists(path):
         os.makedirs(path)
+
+# --------------------- Fast, cached, multiprocessing directory scan ---------------------
+_SCAN_CACHE = {}
+
+def _dir_signature(dir_path):
+    try:
+        entries = []
+        with os.scandir(dir_path) as it:
+            for e in it:
+                if e.is_file():
+                    try:
+                        stat = e.stat()
+                        entries.append((e.name, stat.st_size, int(stat.st_mtime)))
+                    except Exception:
+                        # best-effort; skip entries we cannot stat
+                        continue
+        entries.sort()
+        h = hashlib.sha256()
+        for name, sz, mt in entries:
+            h.update(name.encode('utf-8', errors='ignore'))
+            h.update(str(sz).encode())
+            h.update(str(mt).encode())
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def _h5_nframes(path):
+    try:
+        f = fabio.open(path)
+        n = getattr(f, 'nframes', 1)
+        try:
+            f.close()
+        except Exception:
+            pass
+        return n
+    except Exception:
+        return 0
+
+def scan_directory_images_cached(dir_path, failedcases=None, max_workers=None):
+    """
+    Scan a directory for TIFF and HDF5 images and return unified (imgList, loader_specs).
+    Uses a cache keyed by directory content signature. HDF5 frame counts are computed
+    in parallel using processes. Frames are NOT loaded.
+    """
+    sig = _dir_signature(dir_path)
+    if sig is not None and dir_path in _SCAN_CACHE and _SCAN_CACHE[dir_path][0] == sig:
+        return _SCAN_CACHE[dir_path][1]
+
+    entries = []
+    h5_files = []
+
+    try:
+        file_names = os.listdir(dir_path)
+    except Exception:
+        return [], []
+
+    for f in file_names:
+        if failedcases is not None and f not in failedcases:
+            continue
+        full_file_name = fullPath(dir_path, f)
+        base, ext = os.path.splitext(f)
+        if f == "calibration.tif":
+            continue
+        if ext.lower() in ('.hdf5', '.h5'):
+            h5_files.append((base, ext, full_file_name))
+        elif isImg(full_file_name) and ext.lower() not in ('.hdf5', '.h5'):
+            entries.append((f, ("tiff", full_file_name)))
+
+    # Count HDF5 frames in parallel
+    if h5_files:
+        if max_workers is None:
+            try:
+                max_workers = max(2, min(8, os.cpu_count() or 2))
+            except Exception:
+                max_workers = 2
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            paths = [p for _, _, p in h5_files]
+            nframes_list = list(pool.map(_h5_nframes, paths))
+        for (base, ext, path), nframes in zip(h5_files, nframes_list):
+            if nframes <= 0:
+                continue
+            if nframes == 1:
+                disp = f"{base}_00001{ext}"
+                entries.append((disp, ("h5", path, 0)))
+            else:
+                for i in range(nframes):
+                    disp = f"{base}_{i+1:05d}{ext}"
+                    entries.append((disp, ("h5", path, i)))
+
+    entries.sort(key=lambda x: x[0])
+    imgList = [n for n, _ in entries]
+    specs = [s for _, s in entries]
+
+    if sig is not None:
+        _SCAN_CACHE[dir_path] = (sig, (imgList, specs))
+
+    return imgList, specs

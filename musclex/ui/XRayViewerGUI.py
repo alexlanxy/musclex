@@ -43,6 +43,8 @@ from ..CalibrationSettings import CalibrationSettings
 from .pyqt_utils import *
 from .LogTraceViewer import LogTraceViewer
 from .DoubleZoomGUI import DoubleZoom
+import threading
+from PySide6.QtCore import QTimer
 
 
 class XRayViewerGUI(QMainWindow):
@@ -64,6 +66,7 @@ class XRayViewerGUI(QMainWindow):
         self.filePath = "" # current directory
         self.calSettings = None
         self.numberOfFiles = 0
+        self._provisionalCount = False
         self.currentFileNumber = 0
         self.img_zoom = None # zoom location of original image (x,y range)
         self.checkableButtons = []
@@ -80,6 +83,11 @@ class XRayViewerGUI(QMainWindow):
         self.saved_slice = None
         self.stop_process = False
         self.calSettingsDialog = None
+        self._scan_thread = None
+        self._scan_result = None
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(200)
+        self._scan_timer.timeout.connect(self._checkScanDone)
 
         self.initUI() # initial all GUI
         self.setConnections() # set triggered function for widgetsF
@@ -1648,8 +1656,9 @@ class XRayViewerGUI(QMainWindow):
         Reset the status bar
         """
         fileFullPath = fullPath(self.filePath, self.imgList[self.currentFileNumber])
+        total = str(self.numberOfFiles) + ('*' if self._provisionalCount else '')
         self.imgPathOnStatusBar.setText(
-            'Current File (' + str(self.currentFileNumber + 1) + '/' + str(self.numberOfFiles) + ') : ' + fileFullPath)
+            'Current File (' + str(self.currentFileNumber + 1) + '/' + total + ') : ' + fileFullPath)
 
     def onNewFileSelected(self, newFile):
         """
@@ -1657,9 +1666,27 @@ class XRayViewerGUI(QMainWindow):
         :param newFile: full name of selected file
         """
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.filePath, self.imgList, self.currentFileNumber, self.fileList, self.ext = getImgFiles(str(newFile))
+        # Immediate display of the chosen file without waiting for a full directory scan
+        try:
+            sel_dir, sel_name = os.path.split(str(newFile))
+        except Exception:
+            sel_dir, sel_name = ("", str(newFile))
+        self.filePath = sel_dir
+        base, ext = os.path.splitext(sel_name)
+        if ext.lower() in ('.h5', '.hdf5'):
+            disp = base + '_00001' + ext
+            self.imgList = [disp]
+            self.fileList = [self.imgList, [("h5", os.path.join(self.filePath, sel_name), 0)]]
+        else:
+            self.imgList = [sel_name]
+            self.fileList = [self.imgList, [("tiff", os.path.join(self.filePath, sel_name))]]
+
+        self.currentFileNumber = 0
+        self.ext = '.mixed'
+        self.numberOfFiles = len(self.imgList)
+        self._provisionalCount = True
+
         if self.filePath is not None and self.imgList is not None and self.imgList:
-            self.numberOfFiles = len(self.imgList)
             fileName = self.imgList[self.currentFileNumber]
             self.h5List = []
             self.setH5Mode(str(newFile))
@@ -1670,7 +1697,12 @@ class XRayViewerGUI(QMainWindow):
             self.updateLeftWidgetWidth()
             self.tabWidget.setTabEnabled(1, True)
             self.onImageChanged()
-            #self.launchCalibrationSettings()
+            # Background scan to populate the full directory listing
+            self._scan_result = None
+            self._scan_thread = threading.Thread(target=self._doScanDir, args=(self.filePath,))
+            self._scan_thread.daemon = True
+            self._scan_thread.start()
+            self._scan_timer.start()
         QApplication.restoreOverrideCursor()
             
 
@@ -1692,6 +1724,31 @@ class XRayViewerGUI(QMainWindow):
             self.prevFileButton.hide()
             self.nextFileButton2.hide()
             self.prevFileButton2.hide()
+
+    def _doScanDir(self, dir_path):
+        try:
+            from ..utils.file_manager import scan_directory_images_cached
+            imgList, specs = scan_directory_images_cached(dir_path)
+            self._scan_result = (imgList, specs)
+        except Exception:
+            self._scan_result = None
+
+    def _checkScanDone(self):
+        if self._scan_result is None:
+            return
+        imgList, specs = self._scan_result
+        if imgList and specs:
+            curr = self.imgList[self.currentFileNumber] if self.imgList else None
+            self.imgList = imgList
+            self.fileList = [imgList, specs]
+            self.numberOfFiles = len(imgList)
+            if curr in self.imgList:
+                self.currentFileNumber = self.imgList.index(curr)
+            else:
+                self.currentFileNumber = 0
+        self._provisionalCount = False
+        self._scan_timer.stop()
+        self.resetStatusbar()
 
     def batchProcBtnToggled(self):
         """
