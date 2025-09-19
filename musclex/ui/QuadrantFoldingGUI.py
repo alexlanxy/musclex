@@ -39,7 +39,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from PIL import Image
 from musclex import __version__
-from PySide6.QtCore import QRunnable, QThreadPool, QEventLoop, Signal
+from PySide6.QtCore import QRunnable, QThreadPool, QEventLoop, Signal, QTimer
 from queue import Queue
 import fabio
 from ..utils.file_manager import *
@@ -231,6 +231,7 @@ class QuadrantFoldingGUI(QMainWindow):
         self.chordpoints = []
         self.masked = False
         self.csvManager = None
+        self._provisionalCount = False
         
         self.threadPool = QThreadPool()
         self.tasksQueue = Queue()
@@ -252,6 +253,12 @@ class QuadrantFoldingGUI(QMainWindow):
         self.persistedRotation = None
 
         self.thresh_mask = None
+
+        # Background directory scan support (must be ready before first browseFile call)
+        self._scan_result = None
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(250)
+        self._scan_timer.timeout.connect(self._checkScanDone)
 
         self.initUI() # initial all GUI
 
@@ -3704,8 +3711,9 @@ class QuadrantFoldingGUI(QMainWindow):
         Reset the status bar
         """
         fileFullPath = fullPath(self.filePath, self.imgList[self.currentFileNumber])
+        total = str(self.numberOfFiles) + ('*' if self._provisionalCount else '')
         self.imgPathOnStatusBar.setText(
-            'Current File (' + str(self.currentFileNumber + 1) + '/' + str(self.numberOfFiles) + ') : ' + fileFullPath)
+            'Current File (' + str(self.currentFileNumber + 1) + '/' + total + ') : ' + fileFullPath)
         
     def resetStatusbar2(self):
         """
@@ -3719,6 +3727,23 @@ class QuadrantFoldingGUI(QMainWindow):
             'Current File (' + str(index + 1) + '/' + str(self.numberOfFiles) + ') : ' + fileFullPath)
         self.filenameLineEdit.setText(self.quadFold.img_name)
         self.filenameLineEdit2.setText(self.quadFold.img_name)
+
+    def _checkScanDone(self):
+        if self._scan_result is None:
+            return
+        imgList, specs = self._scan_result
+        if imgList and specs:
+            curr = self.imgList[self.currentFileNumber] if self.imgList else None
+            self.imgList = imgList
+            self.fileList = [imgList, specs]
+            self.numberOfFiles = len(imgList)
+            if curr in self.imgList:
+                self.currentFileNumber = self.imgList.index(curr)
+            else:
+                self.currentFileNumber = 0
+        self._provisionalCount = False
+        self._scan_timer.stop()
+        self.resetStatusbar()
 
     def getFlags(self):
         """
@@ -3806,7 +3831,10 @@ class QuadrantFoldingGUI(QMainWindow):
         :param newFile: full name of selected file
         """
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.filePath, self.imgList, self.currentFileNumber, self.fileList, self.ext = getImgFiles(str(newFile))
+        # Immediate provisional selection for responsiveness (shared helper)
+        self.filePath, self.imgList, self.currentFileNumber, self.fileList, self.ext = build_provisional_selection(str(newFile))
+        self._provisionalCount = True
+
         if self.filePath is not None and self.imgList is not None and self.imgList:
             try:
                 self.csvManager = QF_CSVManager(self.filePath)
@@ -3851,6 +3879,11 @@ class QuadrantFoldingGUI(QMainWindow):
                 self.h5List = []
                 self.setH5Mode(str(newFile))
                 self.onImageChanged()
+
+                # Start background scan to populate full directory list using shared helper
+                self._scan_result = None
+                self._scan_timer.start()
+                async_scan_directory(self.filePath, lambda imgList, specs: setattr(self, "_scan_result", (imgList, specs)))
             else:
                 QApplication.restoreOverrideCursor()
                 self.browseFile()

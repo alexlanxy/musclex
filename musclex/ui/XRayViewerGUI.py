@@ -43,7 +43,6 @@ from ..CalibrationSettings import CalibrationSettings
 from .pyqt_utils import *
 from .LogTraceViewer import LogTraceViewer
 from .DoubleZoomGUI import DoubleZoom
-import threading
 from PySide6.QtCore import QTimer
 
 
@@ -1666,23 +1665,8 @@ class XRayViewerGUI(QMainWindow):
         :param newFile: full name of selected file
         """
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        # Immediate display of the chosen file without waiting for a full directory scan
-        try:
-            sel_dir, sel_name = os.path.split(str(newFile))
-        except Exception:
-            sel_dir, sel_name = ("", str(newFile))
-        self.filePath = sel_dir
-        base, ext = os.path.splitext(sel_name)
-        if ext.lower() in ('.h5', '.hdf5'):
-            disp = base + '_00001' + ext
-            self.imgList = [disp]
-            self.fileList = [self.imgList, [("h5", os.path.join(self.filePath, sel_name), 0)]]
-        else:
-            self.imgList = [sel_name]
-            self.fileList = [self.imgList, [("tiff", os.path.join(self.filePath, sel_name))]]
-
-        self.currentFileNumber = 0
-        self.ext = '.mixed'
+        # Immediate display using shared helper (no full directory scan yet)
+        self.filePath, self.imgList, self.currentFileNumber, self.fileList, self.ext = build_provisional_selection(str(newFile))
         self.numberOfFiles = len(self.imgList)
         self._provisionalCount = True
 
@@ -1697,12 +1681,10 @@ class XRayViewerGUI(QMainWindow):
             self.updateLeftWidgetWidth()
             self.tabWidget.setTabEnabled(1, True)
             self.onImageChanged()
-            # Background scan to populate the full directory listing
+            # Background scan to populate the full directory listing using shared helper
             self._scan_result = None
-            self._scan_thread = threading.Thread(target=self._doScanDir, args=(self.filePath,))
-            self._scan_thread.daemon = True
-            self._scan_thread.start()
             self._scan_timer.start()
+            async_scan_directory(self.filePath, lambda imgList, specs: setattr(self, "_scan_result", (imgList, specs)))
         QApplication.restoreOverrideCursor()
             
 
@@ -1725,13 +1707,6 @@ class XRayViewerGUI(QMainWindow):
             self.nextFileButton2.hide()
             self.prevFileButton2.hide()
 
-    def _doScanDir(self, dir_path):
-        try:
-            from ..utils.file_manager import scan_directory_images_cached
-            imgList, specs = scan_directory_images_cached(dir_path)
-            self._scan_result = (imgList, specs)
-        except Exception:
-            self._scan_result = None
 
     def _checkScanDone(self):
         if self._scan_result is None:

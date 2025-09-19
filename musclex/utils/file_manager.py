@@ -302,3 +302,52 @@ def scan_directory_images_cached(dir_path, failedcases=None, max_workers=None):
         _SCAN_CACHE[dir_path] = (sig, (imgList, specs))
 
     return imgList, specs
+
+# --------------------- Reusable helpers for GUI provisional selection ---------------------
+def build_provisional_selection(fullname):
+    """
+    Build a provisional selection from a single chosen file for immediate GUI display.
+    Returns a tuple compatible with getImgFiles, but without scanning the whole directory:
+      (dir_path, imgList, current_index, fileList, ext)
+
+    - For HDF5, creates a pseudo-display name like base_00001.ext and a loader spec ("h5", path, 0)
+    - For TIFF and other supported images, uses the filename and a loader spec ("tiff", path)
+    - ext is set to '.mixed' to indicate unified mixed-mode
+    """
+    dir_path, sel_name = split(str(fullname))
+    dir_path = str(dir_path)
+    sel_name = str(sel_name)
+    base, ext = os.path.splitext(sel_name)
+
+    if ext.lower() in ('.h5', '.hdf5'):
+        disp = f"{base}_00001{ext}"
+        imgList = [disp]
+        loader_specs = [("h5", os.path.join(dir_path, sel_name), 0)]
+    else:
+        imgList = [sel_name]
+        loader_specs = [("tiff", os.path.join(dir_path, sel_name))]
+
+    current = 0
+    fileList = [imgList, loader_specs]
+    return dir_path, imgList, current, fileList, '.mixed'
+
+def async_scan_directory(dir_path, on_done):
+    """
+    Start a background scan of a directory using scan_directory_images_cached and invoke
+    on_done(imgList, specs) when finished. Returns the Thread object.
+
+    Note: on_done may be executed on a non-GUI thread; if using Qt, marshal back to the main
+    thread (e.g., via signals/QTimer) before touching widgets.
+    """
+    import threading
+
+    def _worker():
+        imgList, specs = scan_directory_images_cached(dir_path)
+        try:
+            on_done(imgList, specs)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return t
