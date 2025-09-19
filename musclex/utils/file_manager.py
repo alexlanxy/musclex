@@ -120,9 +120,14 @@ def getImgFiles(fullname, headless=False):
     current = 0
     if imgList:
         if selected_ext.lower() in ('.hdf5', '.h5'):
-            # If user picked an HDF5, default to its first frame pseudo-name
+            # If user picked an HDF5, prefer master if data/master pair exists
             base, ext = os.path.splitext(filename)
-            preferred = f"{base}_00001{ext}"
+            if "_data_" in base:
+                prefix = base.split("_data_")[0]
+                master_base = f"{prefix}_master"
+                preferred = f"{master_base}_00001{ext}"
+            else:
+                preferred = f"{base}_00001{ext}"
             if preferred in imgList:
                 current = imgList.index(preferred)
             else:
@@ -273,6 +278,24 @@ def scan_directory_images_cached(dir_path, failedcases=None, max_workers=None):
         elif isImg(full_file_name) and ext.lower() not in ('.hdf5', '.h5'):
             entries.append((f, ("tiff", full_file_name)))
 
+    # Filter out data HDF5 files if a corresponding master exists
+    if h5_files:
+        master_prefix_to_record = {}
+        for base, ext, path in h5_files:
+            if base.endswith('_master'):
+                prefix = base[:-7]
+                master_prefix_to_record[prefix] = (base, ext, path)
+
+        filtered_h5 = []
+        for base, ext, path in h5_files:
+            if '_data_' in base:
+                prefix = base.split('_data_')[0]
+                if prefix in master_prefix_to_record:
+                    # Skip data file because master exists
+                    continue
+            filtered_h5.append((base, ext, path))
+        h5_files = filtered_h5
+
     # Count HDF5 frames in parallel
     if h5_files:
         if max_workers is None:
@@ -320,6 +343,14 @@ def build_provisional_selection(fullname):
     base, ext = os.path.splitext(sel_name)
 
     if ext.lower() in ('.h5', '.hdf5'):
+        # If selected a data file and a matching master exists, pivot to master
+        if "_data_" in base:
+            prefix = base.split("_data_")[0]
+            master_name = f"{prefix}_master{ext}"
+            master_path = os.path.join(dir_path, master_name)
+            if os.path.exists(master_path):
+                sel_name = master_name
+                base = f"{prefix}_master"
         disp = f"{base}_00001{ext}"
         imgList = [disp]
         loader_specs = [("h5", os.path.join(dir_path, sel_name), 0)]
