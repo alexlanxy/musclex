@@ -33,6 +33,19 @@ import numpy as np
 #@jit(target_backend='cuda', nopython=True)
 @jit
 def get_avg_fold_float32(quadrants, nQuadrant, fold_height, fold_width, threshold):
+    """
+    Calculate average fold from multiple quadrants with gap edge detection.
+    
+    Parameters:
+    - quadrants: array of quadrant images
+    - nQuadrant: number of quadrants to average
+    - fold_height, fold_width: dimensions of each quadrant
+    - threshold: invalid pixel threshold (typically INVALID_PIXEL_THRESHOLD = -1)
+                 Pixels with value <= threshold are excluded from averaging
+    
+    Returns:
+    - result: averaged fold image with gap edge artifacts removed
+    """
     result = np.zeros((fold_height, fold_width))
     if nQuadrant > 0:
         for x in range(fold_width):
@@ -48,7 +61,8 @@ def get_avg_fold_float32(quadrants, nQuadrant, fold_height, fold_width, threshol
                             not_gap_edge = True
                             for k in range(y-2, y+3):
                                 for l in range(x-2, x+3):
-                                    if fold[k,l] < threshold:
+                                    # Check for invalid pixels (<= threshold, i.e., <= -1)
+                                    if fold[k,l] <= threshold:
                                         not_gap_edge = False
                             if not_gap_edge:
                                 sum_val += fold[y,x]

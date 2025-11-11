@@ -92,7 +92,14 @@ class QuadrantFoldingh:
         if self.delcache:
             if cache_exist:
                 os.remove(cache_path)
-        self.quadFold = QuadrantFolder(self.dir_path, fileName, self, self.fileList, self.ext)
+        
+        # Load the image using fabio
+        img_full_path = fullPath(self.dir_path, fileName)
+        img = fabio.open(img_full_path).data
+        
+        # Create QuadrantFolder with loaded image
+        # Note: QuadrantFolder expects img_name with extension
+        self.quadFold = QuadrantFolder(img, self.dir_path, fileName, self)
 
         if self.inputsettings:
             self.setCalibrationImage()
@@ -163,9 +170,6 @@ class QuadrantFoldingh:
         if 'center' in currentInfo:
             del currentInfo['center']
 
-        if not self.inputsettings and 'calib_center' in currentInfo:
-            del currentInfo['calib_center']
-
     def getExtentAndCenter(self):
         """
         Give the extent and center of the image
@@ -175,14 +179,11 @@ class QuadrantFoldingh:
         if self.quadFold.orig_image_center is None:
             self.quadFold.findCenter()
             self.statusPrint("Done.")
-        if 'calib_center' in self.quadFold.info:
-            center = self.quadFold.info['calib_center']
-        elif 'manual_center' in self.quadFold.info:
-            center = self.quadFold.info['manual_center']
-        else:
-            center = self.quadFold.orig_image_center
+        
+        # Use quadFold.center (which can be manual or auto)
+        center = self.quadFold.center if self.quadFold.center is not None else self.quadFold.orig_image_center
 
-        extent = [self.quadFold.info['center'][0] - center[0], self.quadFold.info['center'][1] - center[1]]
+        extent = [self.quadFold.center[0] - center[0], self.quadFold.center[1] - center[1]]
         return extent, center
 
     def processImage(self):
@@ -280,10 +281,6 @@ class QuadrantFoldingh:
         info = self.quadFold.info
         if 'orientation_model' in info:
             self.orientationModel = info['orientation_model']
-        if self.calSettings is not None and 'center' in self.calSettings and 'calib_center' in info:
-            # Update cal settings center with the corresponding coordinate in original (or initial) image
-            # so that it persists correctly on moving to next image
-            self.calSettings['center'] = info['calib_center']
         self.getExtentAndCenter()
 
     def getFlags(self):
@@ -354,7 +351,9 @@ class QuadrantFoldingh:
                 self.inputsettings = False
                 self.calSettings = None
             if self.calSettings is not None and 'center' in self.calSettings:
-                self.quadFold.info['calib_center'] = self.calSettings['center']
+                # Set center from settings file (treated as manual)
+                center = tuple(self.calSettings['center'])
+                self.quadFold.setBaseCenter(center)
             else:
                 self.inputsettings = False
             if 'manual_center' in self.quadFold.info:
@@ -362,7 +361,8 @@ class QuadrantFoldingh:
             if 'center' in self.quadFold.info:
                 del self.quadFold.info['center']
         else:
-            if self.quadFold is not None and 'calib_center' in self.quadFold.info:
-                del self.quadFold.info['calib_center']
+            # Reset to auto mode
+            if self.quadFold is not None:
+                self.quadFold.setBaseCenter(None)
             if self.quadFold is not None and 'center' in self.quadFold.info:
                 del self.quadFold.info['center']

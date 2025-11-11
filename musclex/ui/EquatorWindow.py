@@ -41,7 +41,7 @@ from skimage.feature import peak_local_max
 from musclex import __version__
 from .pyqt_utils import *
 from ..CalibrationSettings import CalibrationSettings
-from ..utils.file_manager import fullPath, getImgFiles
+from ..utils.file_manager import FileManager, fullPath, getImgFiles
 from ..utils import logger
 from ..utils.image_processor import *
 from ..modules.EquatorImage import EquatorImage, getCardiacGraph
@@ -51,13 +51,15 @@ from ..ui.EQ_FittingTab import EQ_FittingTab
 from .BlankImageSettings import BlankImageSettings
 from .ImageMaskTool import ImageMaskerWindow
 from .DoubleZoomGUI import DoubleZoom
+from .widgets.navigation_controls import NavigationControls
 from skimage.morphology import binary_dilation
-from PySide6.QtCore import QRunnable, QThreadPool, QEventLoop, Signal
+from PySide6.QtCore import QRunnable, QThreadPool, QEventLoop, Signal, QTimer
 from queue import Queue
+
 
 class WorkerSignals(QObject):
     
-    finished = Signal()
+    finished = Signal(object)
     error = Signal(tuple)
     result = Signal(object)
 
@@ -81,7 +83,7 @@ class Worker(QRunnable):
         else:
             self.signals.result.emit(self.bioImg)
         finally:
-            self.signals.finished.emit()
+            self.signals.finished.emit(self.bioImg)
 
 class EquatorWindow(QMainWindow):
     """
@@ -96,8 +98,6 @@ class EquatorWindow(QMainWindow):
         """
         super().__init__()
         self.mainWindow = mainWin
-        self.h5List = [] # if the file selected is an H5 file, regroups all the other h5 files names
-        self.h5index = 0
         self.logger = None
         self.editableVars = {}
         self.bioImg = None  # Current EquatorImage object
@@ -130,7 +130,24 @@ class EquatorWindow(QMainWindow):
         
         self.gap_lines = []
         self.gaps = []
+        
+        # Multiprocessing task management
+        from ..utils.task_manager import ProcessingTaskManager
+        self.taskManager = ProcessingTaskManager()
+        self.processExecutor = None
+        self.currentDisplayIndex = 0
+        self.pendingUIUpdates = {}  # {job_index: task}
+        
+        # UI update timer for sequential display
+        self.uiUpdateTimer = QTimer(self)
+        self.uiUpdateTimer.timeout.connect(self.processUIUpdateQueue)
+        self.uiUpdateTimer.setInterval(100)  # Check every 100ms
 
+        self._provisionalCount = False
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(200)
+        self._scan_timer.timeout.connect(self._checkScanDone)
+        
         self.initUI()  # Initial all UI
 
         self.doubleZoomGUI = DoubleZoom(self.displayImgFigure)
@@ -138,44 +155,118 @@ class EquatorWindow(QMainWindow):
         self.setAllToolTips()  # Set tooltips for widgets
         self.setConnections()  # Set interaction for widgets
         self.show()
-        self.browseFile()
+        self.file_manager = None
 
-        self.dir_path, self.imgList, self.currentImg, self.fileList, self.ext = getImgFiles(str(self.fileName))
-        if self.imgList is None or len(self.imgList) == 0:
+        self.browseFile()
+        
+        if self.file_manager.names is None or len(self.file_manager.names) == 0:
             self.inputerror()
             return
         self.csvManager = EQ_CSVManager(self.dir_path)  # Create a CSV Manager object
         self.setWindowTitle("Muscle X Equator v." + __version__)
-        # self.setStyleSheet(getStyleSheet())
+        self.onImageChanged(first_run=True)
 
-        #self.onImageChanged() # Toggle window to process current image
+    def _checkScanDone(self):
+        """
+        Check if the scan is done
+        """
+        if not self.file_manager:
+            return
         
-
-        self.fileName = self.imgList[self.currentImg]
-        self.filenameLineEdit.setText(self.fileName)
-        self.filenameLineEdit2.setText(self.fileName)
-        self.bioImg = EquatorImage(self.dir_path, self.fileName, self, self.fileList, self.ext)
-        self.bioImg.skeletalVarsNotSet = not ('isSkeletal' in self.bioImg.info and self.bioImg.info['isSkeletal'])
-        self.bioImg.extraPeakVarsNotSet = not ('isExtraPeak' in self.bioImg.info and self.bioImg.info['isExtraPeak'])
-        if 'paramInfo' in self.bioImg.info:
-            self.k_chkbx.setChecked(self.bioImg.info['paramInfo']['k']['fixed'])
-        self.calSettings=None
-        # Fix the value SigmaS and SigmaC for the first run if there is no cache
-        settings=self.getSettings(first_run=(True if 'model' not in self.bioImg.info else False))
-        settings.update(self.bioImg.info)
-        self.initWidgets(settings)
-        self.initMinMaxIntensities(self.bioImg)
-        self.img_zoom = None
+        # Show HDF5 processing progress
+        h5_done, h5_total = self.file_manager.get_h5_progress()
+        if h5_total > 0:
+            if not self.progressBar.isVisible():
+                self.progressBar.setVisible(True)
+                self.progressBar.setRange(0, h5_total)
+            self.progressBar.setValue(h5_done)
+            self.progressBar.setFormat(f"Processing HDF5 files: {h5_done}/{h5_total}")
+        
+        if not self.file_manager.is_scan_done():
+            return
+        
+        # Hide progress bar when done
+        self.progressBar.setVisible(False)
+        self.progressBar.setFormat("%p%")  # Reset format to default
+        
+        self._provisionalCount = False
+        self._scan_timer.stop()
         self.refreshStatusbar()
-        self.setCalibrationImage()
-        #    self.processImage()
 
-        self.setH5Mode(str(self.fileName))
-        self.processImage()
-        # self.init_logging()
-        # focused_widget = QApplication.focusWidget()
-        # if focused_widget != None:
-        #     focused_widget.clearFocus()
+    def initProcessExecutor(self):
+        """Initialize persistent process pool for parallel processing"""
+        from concurrent.futures import ProcessPoolExecutor
+        from ..headless.mp_executor import init_worker
+        import os
+        
+        worker_count = int(os.environ.get('MUSCLEX_WORKERS', max(1, os.cpu_count() - 2)))
+        
+        try:
+            self.processExecutor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=init_worker
+            )
+            print(f"✓ Initialized process pool with {worker_count} workers")
+        except Exception as e:
+            print(f"⚠ Failed to create process pool: {e}")
+            print("  Falling back to single-process mode")
+            self.processExecutor = None
+    
+    def processUIUpdateQueue(self):
+        """
+        Process queued UI updates in submission order.
+        Called by timer every 100ms. Only used during batch processing.
+        """
+        next_index = self.currentDisplayIndex
+        
+        if next_index in self.pendingUIUpdates:
+            task = self.pendingUIUpdates.pop(next_index)
+            self._updateBatchImagePreview(task)
+            
+            self.currentDisplayIndex += 1
+            # Check if more are ready
+            QTimer.singleShot(0, self.processUIUpdateQueue)
+    
+    def _updateBatchImagePreview(self, task):
+        """
+        Lightweight UI update during batch processing.
+        Only updates Image tab if it's currently visible.
+        """
+        # Always update progress and status
+        stats = self.taskManager.get_statistics()
+        self.progressBar.setValue(stats['completed'] + stats['failed'])
+        self.statusReport.setText(
+            f"Processing: {task.filename} ({stats['completed']}/{stats['total']})"
+        )
+        
+        # Update Image tab preview if visible
+        if self.tabWidget.currentIndex() == 0:  # Image tab
+            if task.result and not task.error:
+                # Update bioImg with processed image data from worker
+                self.bioImg.info = task.result['info']
+                self.bioImg.image = task.result['image']
+                # Reconstruct rotated_img cache
+                self.bioImg.rotated_img = [
+                    task.result['info']['center'],
+                    task.result['info']['rotationAngle'],
+                    task.result['image'],
+                    task.result['rotated_img']
+                ]
+                self.updateImageTab()
+        
+        # Immediately release large image data after UI update to prevent memory accumulation
+        if task.result:
+            task.result['image'] = None
+            task.result['rotated_img'] = None
+
+        # Check if batch is complete - check after each UI update
+        # Must ensure: all tasks done + all accounted for + no pending UI updates
+        if (stats['pending'] == 0 and 
+            stats['completed'] + stats['failed'] == stats['total'] and 
+            not self.pendingUIUpdates):
+            self.onBatchComplete()
+        
+        QApplication.processEvents()
 
     def inputerror(self):
         """
@@ -229,6 +320,7 @@ class EquatorWindow(QMainWindow):
         self.imageVLayout.addWidget(self.displayImgCanvas)
 
         self.imgDispOptionGrp = QGroupBox('Display Options')
+        self.imgDispOptionGrp.setStyleSheet("QGroupBox { font-weight: bold; }")
         self.imgDispOptLayout = QGridLayout()
         self.centerChkBx = QCheckBox('Center')
         self.centerChkBx.setChecked(True)
@@ -245,10 +337,12 @@ class EquatorWindow(QMainWindow):
         self.maxIntLabel = QLabel()
         self.minIntSpnBx = QDoubleSpinBox()
         self.minIntSpnBx.setObjectName('minIntSpnBx')
+        self.minIntSpnBx.setRange(-1e10, 1e10)  # Allow any value
         self.editableVars[self.minIntSpnBx.objectName()] = None
         self.minIntSpnBx.setKeyboardTracking(False)
         self.maxIntSpnBx = QDoubleSpinBox()
         self.maxIntSpnBx.setObjectName('maxIntSpnBx')
+        self.maxIntSpnBx.setRange(-1e10, 1e10)  # Allow any value
         self.editableVars[self.maxIntSpnBx.objectName()] = None
         self.maxIntSpnBx.setKeyboardTracking(False)
         self.logScaleIntChkBx = QCheckBox("Log scale intensity")
@@ -281,6 +375,7 @@ class EquatorWindow(QMainWindow):
         self.imgDispOptionGrp.setLayout(self.imgDispOptLayout)
 
         self.imgProcGrp = QGroupBox("Image Processing")
+        self.imgProcGrp.setStyleSheet("QGroupBox { font-weight: bold; }")
         self.imgProcLayout = QGridLayout()
         self.imgProcGrp.setLayout(self.imgProcLayout)
         self.calibrationB = QPushButton("Calibration Settings")
@@ -389,29 +484,12 @@ class EquatorWindow(QMainWindow):
         self.rejectChkBx = QCheckBox("Reject")
         self.rejectChkBx.setFixedWidth(100)
 
-        pfss = "QPushButton { color: #ededed; background-color: #af6207}"
-        self.processFolderButton = QPushButton("Reprocess and Refit current folder")
-        self.processFolderButton.setStyleSheet(pfss)
-        self.processFolderButton.setCheckable(True)
-        self.processH5FolderButton = QPushButton("Process All H5 Files")
-        self.processH5FolderButton.setStyleSheet(pfss)
-        self.processH5FolderButton.setCheckable(True)
+        # Reusable navigation controls for Image tab
+        self.navImg = NavigationControls(process_folder_text="Process Current Folder", process_h5_text="Process Current H5 File")
+
         self.bottomLayout = QGridLayout()
-        self.nextButton = QPushButton(">")
-        self.prevButton = QPushButton("<")
-        self.nextFileButton = QPushButton(">>>")
-        self.prevFileButton = QPushButton("<<<")
-        self.nextButton.setToolTip('Next Frame')
-        self.prevButton.setToolTip('Previous Frame')
-        self.filenameLineEdit = QLineEdit()
         self.bottomLayout.addWidget(self.rejectChkBx, 0, 0, 1, 2)
-        self.bottomLayout.addWidget(self.processFolderButton, 1, 0, 1, 2)
-        self.bottomLayout.addWidget(self.processH5FolderButton, 2, 0, 1, 2)
-        self.bottomLayout.addWidget(self.prevButton, 3, 0, 1, 1)
-        self.bottomLayout.addWidget(self.nextButton, 3, 1, 1, 1)
-        self.bottomLayout.addWidget(self.prevFileButton, 4, 0, 1, 1)
-        self.bottomLayout.addWidget(self.nextFileButton, 4, 1, 1, 1)
-        self.bottomLayout.addWidget(self.filenameLineEdit, 5, 0, 1, 2)
+        self.bottomLayout.addWidget(self.navImg, 1, 0, 1, 2)
         self.bottomLayout.setAlignment(self.rejectChkBx, Qt.AlignLeft)
 
         self.imageOptionsFrame = QFrame()
@@ -442,6 +520,7 @@ class EquatorWindow(QMainWindow):
         self.fittingCanvas = FigureCanvas(self.fittingFigure)
 
         self.generalGrp = QGroupBox("General Settings")
+        self.generalGrp.setStyleSheet("QGroupBox { font-weight: bold; }")
         self.genLayout = QGridLayout(self.generalGrp)
         self.skeletalChkBx = QCheckBox("Skeletal Muscle (Z line)")
         self.skeletalChkBx.setFixedWidth(200)
@@ -472,6 +551,7 @@ class EquatorWindow(QMainWindow):
         self.genLayout.addWidget(self.setPeaksB, 4, 0, 1, 2)
 
         self.fitDispOptionGrp = QGroupBox('Display Options')
+        self.fitDispOptionGrp.setStyleSheet("QGroupBox { font-weight: bold; }")
         self.fitDispOptLayout = QGridLayout()
         self.origHistChkBx = QCheckBox('Original\nHistogram')
         self.hullChkBx = QCheckBox('After\nConvexhull')
@@ -531,6 +611,7 @@ class EquatorWindow(QMainWindow):
         self.use_smooth_spnbx.setValue(3)
 
         self.gaps_grp_bx = QGroupBox()
+        self.gaps_grp_bx.setStyleSheet("QGroupBox { font-weight: bold; }")
         self.gaps_grp_bx_layout = QVBoxLayout()
         self.gaps_grp_bx.setLayout(self.gaps_grp_bx_layout)
         self.marginLayout = QHBoxLayout()
@@ -570,28 +651,11 @@ class EquatorWindow(QMainWindow):
         self.refitAllButton = QPushButton("Refit current folder")
         self.refitAllButton.setCheckable(True)
 
-        pfss = "QPushButton { color: #ededed; background-color: #af6207}"
-        self.processFolderButton2 = QPushButton("Reprocess and Refit current folder")
-        self.processFolderButton2.setStyleSheet(pfss)
-        self.processFolderButton2.setCheckable(True)
-        self.processH5FolderButton2 = QPushButton("Reprocess and Refit All H5 Files")
-        self.processH5FolderButton2.setStyleSheet(pfss)
-        self.processH5FolderButton2.setCheckable(True)
+        # Reusable navigation controls for Fitting tab
+        self.navFit = NavigationControls(process_folder_text="Process Current Folder", process_h5_text="Process Current H5 File")
+
         self.bottomLayout2 = QGridLayout()
-        self.nextButton2 = QPushButton(">")
-        self.prevButton2 = QPushButton("<")
-        self.nextFileButton2 = QPushButton(">>>")
-        self.prevFileButton2 = QPushButton("<<<")
-        self.nextButton2.setToolTip('Next Frame')
-        self.prevButton2.setToolTip('Previous Frame')
-        self.filenameLineEdit2 = QLineEdit()
-        self.bottomLayout2.addWidget(self.processFolderButton2, 0, 0, 1, 2)
-        self.bottomLayout2.addWidget(self.processH5FolderButton2, 1, 0, 1, 2)
-        self.bottomLayout2.addWidget(self.prevButton2, 2, 0, 1, 1)
-        self.bottomLayout2.addWidget(self.nextButton2, 2, 1, 1, 1)
-        self.bottomLayout2.addWidget(self.prevFileButton2, 3, 0, 1, 1)
-        self.bottomLayout2.addWidget(self.nextFileButton2, 3, 1, 1, 1)
-        self.bottomLayout2.addWidget(self.filenameLineEdit2, 4, 0, 1, 2)
+        self.bottomLayout2.addWidget(self.navFit, 0, 0, 1, 2)
 
         self.fittingOptionsFrame1 = QFrame()
         self.fittingOptionsFrame1.setFixedWidth(505)
@@ -648,6 +712,7 @@ class EquatorWindow(QMainWindow):
         self.parameterEditorTab.setContentsMargins(0, 0, 0, 0)
         self.parameterEditorLayout = QGridLayout(self.parameterEditorTab)
         self.paramEditorTitlebox = QGroupBox()
+        self.paramEditorTitlebox.setStyleSheet("QGroupBox { font-weight: bold; }")
         self.paramEditorTitleboxLayout = QGridLayout()
 
         self.parameterEditorTable = QTableWidget()
@@ -734,8 +799,6 @@ class EquatorWindow(QMainWindow):
         Set Tooltips for widgets
         """
         ### image tab ###
-        self.nextFileButton.setToolTip('Next H5 File in this Folder')
-        self.prevFileButton.setToolTip('Previous H5 File in this Folder')
         self.centerChkBx.setToolTip("Show the detected projection center")
         self.intChkBx.setToolTip("Show the detected Integrated area ")
         self.rminChkBx.setToolTip("Show the detected R-min")
@@ -764,13 +827,9 @@ class EquatorWindow(QMainWindow):
         self.resetAllB.setToolTip("Reset all manual settings, and process image again with default detection")
         self.rejectChkBx.setToolTip(
             "Reject the case when model cannot be fitted. The word \"REJECTED\" will appear in summary.csv")
-        self.nextButton.setToolTip("Go to the next image in this folder")
-        self.prevButton.setToolTip("Go to the previous image in this folder")
-        self.processFolderButton.setToolTip("Process all images in the same directory as the current file with current fitting parameters and image settings")
+        self.navImg.processFolderButton.setToolTip("Process all images in the same directory as the current file with current fitting parameters and image settings")
 
         ### Fitting tab ###
-        self.nextFileButton2.setToolTip('Next H5 File in this Folder')
-        self.prevFileButton2.setToolTip('Previous H5 File in this Folder')
         self.nPeakSpnBx.setToolTip("Select number of peaks on each side that will be fitted by model")
         self.modelSelect.setToolTip("Select the fitting model")
         self.setPeaksB.setToolTip(
@@ -783,9 +842,7 @@ class EquatorWindow(QMainWindow):
         self.fitChkBx.setToolTip("Show the fitting graph")
         self.graphZoomInB.setToolTip("Activate zoom-in operation, click on the graph to select zoom-in area")
         self.graphZoomOutB.setToolTip("Activate zoom-in operation")
-        self.nextButton2.setToolTip("Go to the next image in this folder")
-        self.prevButton2.setToolTip("Go to the previous image in this folder")
-        self.processFolderButton2.setToolTip("Process all images in the same directory as the current file with current fitting parameters and image settings")
+        self.navFit.processFolderButton.setToolTip("Process all images in the same directory as the current file with current fitting parameters and image settings")
         self.refittingB.setToolTip("If you change parameters relating to image processing (e.g. center finding) they will not be used when you refit. Also, image processing parameters (e.g. center) will not change when you refit.")
         self.refitAllButton.setToolTip("Refit all images in the directory again with current fitting parameters")
 
@@ -838,14 +895,14 @@ class EquatorWindow(QMainWindow):
         self.forceRot90ChkBx.stateChanged.connect(self.forceRot90Checked)
         self.resetAllB.clicked.connect(self.resetAll)
 
-        self.prevButton.clicked.connect(self.prevClicked)
-        self.nextButton.clicked.connect(self.nextClicked)
-        self.nextFileButton.clicked.connect(self.nextFileClicked)
-        self.prevFileButton.clicked.connect(self.prevFileClicked)
-        #self.processFolderButton.clicked.connect(self.processFolder)
-        self.processFolderButton.toggled.connect(self.batchProcBtnToggled)
-        self.processH5FolderButton.toggled.connect(self.h5batchProcBtnToggled)
-        self.filenameLineEdit.editingFinished.connect(self.fileNameChanged)
+        self.navImg.prevButton.clicked.connect(self.prevClicked)
+        self.navImg.nextButton.clicked.connect(self.nextClicked)
+        self.navImg.nextFileButton.clicked.connect(self.nextFileClicked)
+        self.navImg.prevFileButton.clicked.connect(self.prevFileClicked)
+        #self.navImg.processFolderButton.clicked.connect(self.processFolder)
+        self.navImg.processFolderButton.toggled.connect(self.batchProcBtnToggled)
+        self.navImg.processH5Button.toggled.connect(self.h5batchProcBtnToggled)
+        self.navImg.filenameLineEdit.editingFinished.connect(self.fileNameChanged)
         self.displayImgFigure.canvas.mpl_connect('button_press_event', self.imgClicked)
         self.displayImgFigure.canvas.mpl_connect('motion_notify_event', self.imgOnMotion)
         self.displayImgFigure.canvas.mpl_connect('button_release_event', self.imgReleased)
@@ -867,14 +924,14 @@ class EquatorWindow(QMainWindow):
         self.graphZoomInB.clicked.connect(self.graphZoomIn)
         self.graphZoomOutB.clicked.connect(self.graphZoomOut)
 
-        #self.processFolderButton2.clicked.connect(self.processFolder)
-        self.processFolderButton2.toggled.connect(self.batchProcBtnToggled)
-        self.processH5FolderButton2.toggled.connect(self.h5batchProcBtnToggled)
-        self.prevButton2.clicked.connect(self.prevClicked)
-        self.nextButton2.clicked.connect(self.nextClicked)
-        self.nextFileButton2.clicked.connect(self.nextFileClicked)
-        self.prevFileButton2.clicked.connect(self.prevFileClicked)
-        self.filenameLineEdit2.editingFinished.connect(self.fileNameChanged)
+        #self.navFit.processFolderButton.clicked.connect(self.processFolder)
+        self.navFit.processFolderButton.toggled.connect(self.batchProcBtnToggled)
+        self.navFit.processH5Button.toggled.connect(self.h5batchProcBtnToggled)
+        self.navFit.prevButton.clicked.connect(self.prevClicked)
+        self.navFit.nextButton.clicked.connect(self.nextClicked)
+        self.navFit.nextFileButton.clicked.connect(self.nextFileClicked)
+        self.navFit.prevFileButton.clicked.connect(self.prevFileClicked)
+        self.navFit.filenameLineEdit.editingFinished.connect(self.fileNameChanged)
         self.fittingFigure.canvas.mpl_connect('button_press_event', self.plotClicked)
         self.fittingFigure.canvas.mpl_connect('motion_notify_event', self.plotOnMotion)
         self.fittingFigure.canvas.mpl_connect('button_release_event', self.plotReleased)
@@ -1069,7 +1126,7 @@ class EquatorWindow(QMainWindow):
         Refit current folder
         """
         ## Popup confirm dialog with settings
-        nImg = len(self.imgList)
+        nImg = len(self.file_manager.names)
         errMsg = QMessageBox()
         errMsg.setText('Refitting All')
         text = 'The current folder will be refitted using current settings. Make sure to adjust them before refitting the folder. \n\n'
@@ -1205,11 +1262,8 @@ class EquatorWindow(QMainWindow):
         #     self.resetAll()
         
         isH5 = False
-        if self.h5List:
-            fileName = self.h5List[self.h5index]
+        if self.file_manager.current_file_type == 'h5':
             isH5 = True
-        else:
-            fileName = self.imgList[self.currentImg]
 
         img = self.bioImg.getRotatedImage()
 
@@ -1639,6 +1693,13 @@ class EquatorWindow(QMainWindow):
                 errMsg.exec_()
 
         self.fileName = file_name
+        if not self.file_manager:
+            self.file_manager = FileManager()
+        self.file_manager.set_from_file(str(file_name))
+        self.dir_path = self.file_manager.dir_path
+        self._provisionalCount = True
+        self._scan_timer.start()
+        self.file_manager.start_async_scan(self.file_manager.dir_path)
 
 
     def saveSettings(self):
@@ -1676,100 +1737,224 @@ class EquatorWindow(QMainWindow):
         """
         Triggered when the process batch button is toggled.
         """
-        if self.processFolderButton.isChecked():
+        if self.navImg.processFolderButton.isChecked():
             if not self.in_batch_process:
-                self.processFolderButton.setText("Stop")
+                self.navImg.processFolderButton.setText("Stop")
                 self.processFolder()
-        elif self.processFolderButton2.isChecked():
+        elif self.navFit.processFolderButton.isChecked():
             if not self.in_batch_process:
-                self.processFolderButton2.setText("Stop")
+                self.navFit.processFolderButton.setText("Stop")
                 self.processFolder()
         else:
-            self.stop_process = True
+            self.stopProcess()
 
     def h5batchProcBtnToggled(self):
         """
         Triggered when the batch process button is toggled
         """
-        if self.processH5FolderButton.isChecked():
+        if self.navImg.processH5Button.isChecked():
             if not self.progressBar.isVisible():
-                self.processH5FolderButton.setText("Stop")
+                self.navImg.processH5Button.setText("Stop")
                 self.processH5Folder()
-        elif self.processH5FolderButton2.isChecked():
+        elif self.navFit.processH5Button.isChecked():
             if not self.progressBar.isVisible():
-                self.processH5FolderButton2.setText("Stop")
+                self.navFit.processH5Button.setText("Stop")
                 self.processH5Folder()
         else:
-            self.stop_process = True
+            self.stopProcess()
+
+    def onBatchComplete(self):
+        """Called when all batch tasks complete"""
+        stats = self.taskManager.get_statistics()
+        
+        # Re-enable navigation
+        self.navImg.prevButton.setEnabled(True)
+        self.navImg.nextButton.setEnabled(True)
+        self.navFit.prevButton.setEnabled(True)
+        self.navFit.nextButton.setEnabled(True)
+        
+        # Print summary
+        print("\n" + "="*60)
+        print("BATCH PROCESSING COMPLETE")
+        print("="*60)
+        print(f"Total: {stats['total']}, Success: {stats['completed']}, Failed: {stats['failed']}")
+        print(f"Average time: {stats['avg_time']:.2f}s per image")
+        print("="*60)
+        
+        # Cleanup
+        self._cleanupAfterBatch()
+        
+        # Show completion dialog
+        QMessageBox.information(self, "Batch Complete",
+            f"Processed {stats['completed']}/{stats['total']} images\n"
+            f"Failed: {stats['failed']}\n"
+            f"Avg time: {stats['avg_time']:.2f}s per image")
+    
+
+    def _cleanupAfterBatch(self):
+        """
+        Cleanup after batch processing completes.
+        Properly shuts down process pool and releases all resources.
+        """
+        # Stop UI update timer
+        if self.uiUpdateTimer.isActive():
+            self.uiUpdateTimer.stop()
+        
+        # Shutdown process pool properly to release child processes
+        if self.processExecutor:
+            try:
+                print("Shutting down process pool...")
+                self.processExecutor.shutdown(wait=True, cancel_futures=False)
+                print("✓ Process pool shutdown complete")
+            except Exception as e:
+                print(f"⚠ Error shutting down process pool: {e}")
+        
+        # Cleanup UI state
+        self.in_batch_process = False
+        self.progressBar.setVisible(False)
+        self.navImg.processFolderButton.setChecked(False)
+        self.navFit.processFolderButton.setChecked(False)
+        self.navImg.processFolderButton.setText("Process current folder")
+        self.navFit.processFolderButton.setText("Process current folder")
+        
+        # Clear reference after shutdown
+        self.processExecutor = None
+    
+    def _buildProcessSettingsText(self, settings, nImg, description):
+        """
+        Build settings information text for process confirmation dialog
+        
+        Args:
+            settings: Current settings dictionary
+            nImg: Number of images to process
+            description: Description of what will be processed
+            
+        Returns:
+            Formatted text string with all settings
+        """
+        text = f'The {description} will be processed using current settings. Make sure to adjust them before processing. \n\n'
+        text += "\nCurrent Settings"
+
+        if 'fixed_angle' in settings:
+            text += "\n  - Fixed Angle : " + str(settings["fixed_angle"])
+        if 'fixed_rmin' in settings:
+            text += "\n  - Fixed R-min : " + str(settings["fixed_rmin"])
+        if 'fixed_rmax' in settings:
+            text += "\n  - Fixed R-max : " + str(settings["fixed_rmax"])
+        if 'fixed_int_area' in settings:
+            text += "\n  - Fixed Box Width : " + str(settings["fixed_int_area"])
+
+        text += "\n  - Orientation Finding : " + str(self.orientationCmbBx.currentText())
+        text += "\n  - Skeletal Muscle : " + str(settings["isSkeletal"])
+        text += "\n  - Extra Peak : " + str(settings["isExtraPeak"])
+        text += "\n  - Number of Peaks on each side : " + str(settings["nPeaks"])
+        text += "\n  - Model : " + str(settings["model"])
+
+        for side in ['left', 'right']:
+            if side+'_fix_sigmac' in settings:
+                text += "\n  - "+side+" Fixed Sigma C : " + str(settings[side+'_fix_sigmac'])
+            if side+'_fix_sigmad' in settings:
+                text += "\n  - "+side+" Fixed Sigma D : " + str(settings[side+'_fix_sigmad'])
+            if side+'_fix_sigmas' in settings:
+                text += "\n  - "+side+" Fixed Sigma S : " + str(settings[side+'_fix_sigmas'])
+            if side+'_fix_gamma' in settings:
+                text += "\n  - "+side+" Fixed Gamma : " + str(settings[side+'_fix_gamma'])
+            if side+'_fix_zline' in settings:
+                text += "\n  - "+side+" Fixed Z line Center: " + str(settings[side+'_fix_zline'])
+            if side+'_fix_intz' in settings:
+                text += "\n  - "+side+" Fixed Z line Intensity : " + str(settings[side+'_fix_intz'])
+            if side+'_fix_sigz' in settings:
+                text += "\n  - "+side+" Fixed Z line Sigma : " + str(settings[side+'_fix_sigz'])
+            if side+'_fix_gammaz' in settings:
+                text += "\n  - "+side+" Fixed Z line Gamma : " + str(settings[side+'_fix_gammaz'])
+            if side+'_fix_zline_EP' in settings:
+                text += "\n  - "+side+" Fixed Extra Peak Center: " + str(settings[side+'_fix_zline_EP'])
+            if side+'_fix_intz_EP' in settings:
+                text += "\n  - "+side+" Fixed Extra Peak Intensity : " + str(settings[side+'_fix_intz_EP'])
+            if side+'_fix_sigz_EP' in settings:
+                text += "\n  - "+side+" Fixed Extra Peak Sigma : " + str(settings[side+'_fix_sigz_EP'])
+            if side+'_fix_gammaz_EP' in settings:
+                text += "\n  - "+side+" Fixed Extra Peak Gamma : " + str(settings[side+'_fix_gammaz_EP'])
+
+        if self.calSettings is not None and len(self.calSettings) > 0:
+            if "center" in self.calSettings:
+                text += "\n  - Calibration Center : " + str(self.calSettings["center"])
+            if 'type' in self.calSettings:
+                if self.calSettings["type"] == "img":
+                    text += "\n  - Silver Behenate : " + str(self.calSettings["silverB"]) + " nm"
+                    text += "\n  - Sdd : " + str(self.calSettings["radius"]) + " pixels"
+                else:
+                    text += "\n  - Lambda : " + str(self.calSettings["lambda"]) + " nm"
+                    text += "\n  - Sdd : " + str(self.calSettings["sdd"]) + " mm"
+                    text += "\n  - Pixel Size : " + str(self.calSettings["pixel_size"]) + " nm"
+
+        text += f'\n\nAre you sure you want to process {nImg} image(s)? \nThis might take a long time.'
+        return text
+
+    def _batchProcessImages(self, job_indices, process_type="folder"):
+        """
+        Common batch processing logic using multiprocessing
+        
+        Args:
+            job_indices: List or range of indices in self.file_manager.names to process
+            process_type: Type of processing ("folder" or "h5") for logging
+        """
+        # Fallback to old method if multiprocessing failed
+        if self.processExecutor is None:
+            self.initProcessExecutor()
+
+        nImg = len(job_indices)
+        
+        # Setup for batch processing
+        self.in_batch_process = True
+        self.stop_process = False
+        
+        # Reset task management
+        self.taskManager.clear()
+        self.currentDisplayIndex = 0
+        self.pendingUIUpdates = {}
+        
+        # Display progress bar
+        self.progressBar.setMaximum(nImg)
+        self.progressBar.setMinimum(0)
+        self.progressBar.setValue(0)
+        self.progressBar.setVisible(True)
+        
+        
+        # Prepare settings
+        settings = self.getSettings()
+        settings['no_cache'] = True 
+        
+        # Submit all jobs to process pool
+        from ..headless.mp_executor import process_one_image
+        
+        for job_index in job_indices:
+            if self.stop_process:
+                break
+            
+            filename = self.file_manager.names[job_index]
+            spec = self.file_manager.specs[job_index]
+            job_args = (settings, None, self.file_manager.dir_path, filename, spec)
+            
+            future = self.processExecutor.submit(process_one_image, job_args)
+            task = self.taskManager.submit_task(filename, job_index, future)
+            
+            # Attach callback
+            future.add_done_callback(self._onFutureDone)
+        
+        print(f"Batch {process_type} started: {nImg} images submitted to process pool")
 
     def processFolder(self):
         """
         Process current folder
         """
-
         ## Popup confirm dialog with settings
-        nImg = len(self.imgList)
+        nImg = len(self.file_manager.names)
+        settings = self.getSettings()
+        
         errMsg = QMessageBox()
         errMsg.setText('Process Current Folder')
-        text = 'The current folder will be processed using current settings. Make sure to adjust them before processing the folder. \n\n'
-        settings = self.getSettings()
-        text += "\nCurrent Settings"
-
-        if 'fixed_angle' in settings:
-            text += "\n  - Fixed Angle : " + str(settings["fixed_angle"])
-        if 'fixed_rmin' in settings:
-            text += "\n  - Fixed R-min : " + str(settings["fixed_rmin"])
-        if 'fixed_rmax' in settings:
-            text += "\n  - Fixed R-max : " + str(settings["fixed_rmax"])
-        if 'fixed_int_area' in settings:
-            text += "\n  - Fixed Box Width : " + str(settings["fixed_int_area"])
-
-        text += "\n  - Orientation Finding : " + str(self.orientationCmbBx.currentText())
-        text += "\n  - Skeletal Muscle : " + str(settings["isSkeletal"])
-        text += "\n  - Extra Peak : " + str(settings["isExtraPeak"])
-        text += "\n  - Number of Peaks on each side : " + str(settings["nPeaks"])
-        text += "\n  - Model : " + str(settings["model"])
-
-        for side in ['left', 'right']:
-            if side+'_fix_sigmac' in settings:
-                text += "\n  - "+side+" Fixed Sigma C : " + str(settings[side+'_fix_sigmac'])
-            if side+'_fix_sigmad' in settings:
-                text += "\n  - "+side+" Fixed Sigma D : " + str(settings[side+'_fix_sigmad'])
-            if side+'_fix_sigmas' in settings:
-                text += "\n  - "+side+" Fixed Sigma S : " + str(settings[side+'_fix_sigmas'])
-            if side+'_fix_gamma' in settings:
-                text += "\n  - "+side+" Fixed Gamma : " + str(settings[side+'_fix_gamma'])
-            if side+'_fix_zline' in settings:
-                text += "\n  - "+side+" Fixed Z line Center: " + str(settings[side+'_fix_zline'])
-            if side+'_fix_intz' in settings:
-                text += "\n  - "+side+" Fixed Z line Intensity : " + str(settings[side+'_fix_intz'])
-            if side+'_fix_sigz' in settings:
-                text += "\n  - "+side+" Fixed Z line Sigma : " + str(settings[side+'_fix_sigz'])
-            if side+'_fix_gammaz' in settings:
-                text += "\n  - "+side+" Fixed Z line Gamma : " + str(settings[side+'_fix_gammaz'])
-            if side+'_fix_zline_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Center: " + str(settings[side+'_fix_zline_EP'])
-            if side+'_fix_intz_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Intensity : " + str(settings[side+'_fix_intz_EP'])
-            if side+'_fix_sigz_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Sigma : " + str(settings[side+'_fix_sigz_EP'])
-            if side+'_fix_gammaz_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Gamma : " + str(settings[side+'_fix_gammaz_EP'])
-
-        if self.calSettings is not None and len(self.calSettings) > 0:
-            if "center" in self.calSettings:
-                text += "\n  - Calibration Center : " + str(self.calSettings["center"])
-            if 'type' in self.calSettings:
-                if self.calSettings["type"] == "img":
-                    text += "\n  - Silver Behenate : " + str(self.calSettings["silverB"]) + " nm"
-                    text += "\n  - Sdd : " + str(self.calSettings["radius"]) + " pixels"
-                else:
-                    text += "\n  - Lambda : " + str(self.calSettings["lambda"]) + " nm"
-                    text += "\n  - Sdd : " + str(self.calSettings["sdd"]) + " mm"
-                    text += "\n  - Pixel Size : " + str(self.calSettings["pixel_size"]) + " nm"
-
-        text += '\n\nAre you sure you want to process ' + str(
-            nImg) + ' image(s) in this Folder? \nThis might take a long time.'
+        text = self._buildProcessSettingsText(settings, nImg, "current folder")
         errMsg.setInformativeText(text)
         errMsg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
         errMsg.setIcon(QMessageBox.Warning)
@@ -1777,100 +1962,25 @@ class EquatorWindow(QMainWindow):
 
         # If "yes" is pressed
         if ret == QMessageBox.Yes:
-
-            # Display progress bar
-            self.progressBar.setMaximum(nImg)
-            self.progressBar.setMinimum(0)
-            self.progressBar.setVisible(True)
-
-            ## Process all images and update progress bar
-            self.in_batch_process = True
-            self.stop_process = False
-            for i in range(nImg):
-                if self.stop_process:
-                    break
-                # self.progressBar.setValue(i)
-                QApplication.processEvents()
-                self.nextImageFitting(True)
-            self.in_batch_process = False
-
-        # self.progressBar.setVisible(False)
-        self.processFolderButton.setChecked(False)
-        self.processFolderButton2.setChecked(False)
-        if self.ext in ['.h5', '.hdf5']:
-            self.processFolderButton.setText("Reprocess and Refit current H5 File")
-            self.processFolderButton2.setText("Reprocess and Refit current H5 File")
+            # Process all images in folder
+            self._batchProcessImages(range(len(self.file_manager.names)), process_type="folder")
         else:
-            self.processFolderButton.setText("Reprocess and Refit current folder")
-            self.processFolderButton2.setText("Reprocess and Refit current folder")
+            # User cancelled
+            self.navImg.processFolderButton.setChecked(False)
+            self.navFit.processFolderButton.setChecked(False)
+            
 
     def processH5Folder(self):
         """
-        Process current folder of H5 file
+        Process current H5 file (all frames)
         """
         ## Popup confirm dialog with settings
-        nImg = len(self.imgList)
-        errMsg = QMessageBox()
-        errMsg.setText('Process Current Folder')
-        text = 'The current folder will be processed using current settings. Make sure to adjust them before processing the folder. \n\n'
+        nImg = self.file_manager.current_h5_nframes
         settings = self.getSettings()
-        text += "\nCurrent Settings"
-
-        if 'fixed_angle' in settings:
-            text += "\n  - Fixed Angle : " + str(settings["fixed_angle"])
-        if 'fixed_rmin' in settings:
-            text += "\n  - Fixed R-min : " + str(settings["fixed_rmin"])
-        if 'fixed_rmax' in settings:
-            text += "\n  - Fixed R-max : " + str(settings["fixed_rmax"])
-        if 'fixed_int_area' in settings:
-            text += "\n  - Fixed Box Width : " + str(settings["fixed_int_area"])
-
-        text += "\n  - Orientation Finding : " + str(self.orientationCmbBx.currentText())
-        text += "\n  - Skeletal Muscle : " + str(settings["isSkeletal"])
-        text += "\n  - Extra Peak : " + str(settings["isExtraPeak"])
-        text += "\n  - Number of Peaks on each side : " + str(settings["nPeaks"])
-        text += "\n  - Model : " + str(settings["model"])
-
-        for side in ['left', 'right']:
-            if side+'_fix_sigmac' in settings:
-                text += "\n  - "+side+" Fixed Sigma C : " + str(settings[side+'_fix_sigmac'])
-            if side+'_fix_sigmad' in settings:
-                text += "\n  - "+side+" Fixed Sigma D : " + str(settings[side+'_fix_sigmad'])
-            if side+'_fix_sigmas' in settings:
-                text += "\n  - "+side+" Fixed Sigma S : " + str(settings[side+'_fix_sigmas'])
-            if side+'_fix_gamma' in settings:
-                text += "\n  - "+side+" Fixed Gamma : " + str(settings[side+'_fix_gamma'])
-            if side+'_fix_zline' in settings:
-                text += "\n  - "+side+" Fixed Z line Center: " + str(settings[side+'_fix_zline'])
-            if side+'_fix_intz' in settings:
-                text += "\n  - "+side+" Fixed Z line Intensity : " + str(settings[side+'_fix_intz'])
-            if side+'_fix_sigz' in settings:
-                text += "\n  - "+side+" Fixed Z line Sigma : " + str(settings[side+'_fix_sigz'])
-            if side+'_fix_gammaz' in settings:
-                text += "\n  - "+side+" Fixed Z line Gamma : " + str(settings[side+'_fix_gammaz'])
-            if side+'_fix_zline_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Center: " + str(settings[side+'_fix_zline_EP'])
-            if side+'_fix_intz_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Intensity : " + str(settings[side+'_fix_intz_EP'])
-            if side+'_fix_sigz_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Sigma : " + str(settings[side+'_fix_sigz_EP'])
-            if side+'_fix_gammaz_EP' in settings:
-                text += "\n  - "+side+" Fixed Extra Peak Gamma : " + str(settings[side+'_fix_gammaz_EP'])
-
-        if self.calSettings is not None and len(self.calSettings) > 0:
-            if "center" in self.calSettings:
-                text += "\n  - Calibration Center : " + str(self.calSettings["center"])
-            if 'type' in self.calSettings:
-                if self.calSettings["type"] == "img":
-                    text += "\n  - Silver Behenate : " + str(self.calSettings["silverB"]) + " nm"
-                    text += "\n  - Sdd : " + str(self.calSettings["radius"]) + " pixels"
-                else:
-                    text += "\n  - Lambda : " + str(self.calSettings["lambda"]) + " nm"
-                    text += "\n  - Sdd : " + str(self.calSettings["sdd"]) + " mm"
-                    text += "\n  - Pixel Size : " + str(self.calSettings["pixel_size"]) + " nm"
-
-        text += '\n\nAre you sure you want to process ' + str(
-            len(self.h5List)) + ' H5 file(s) in this Folder? \nThis might take a long time.'
+        
+        errMsg = QMessageBox()
+        errMsg.setText('Process Current H5 File')
+        text = self._buildProcessSettingsText(settings, nImg, "current H5 file")
         errMsg.setInformativeText(text)
         errMsg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
         errMsg.setIcon(QMessageBox.Warning)
@@ -1878,32 +1988,62 @@ class EquatorWindow(QMainWindow):
 
         # If "yes" is pressed
         if ret == QMessageBox.Yes:
+            # Get the range of indices corresponding to current H5 file
+            current_h5_path = self.file_manager._get_current_file_info()[2]  # Get file path
+            if current_h5_path in self.file_manager.h5_index_map:
+                start_idx, end_idx = self.file_manager.h5_index_map[current_h5_path]
+                # Process all frames in this H5 file
+                self._batchProcessImages(range(start_idx, end_idx + 1), process_type="h5")
+            else:
+                print("Error: Could not find H5 file in index map")
+        else:
+            # User cancelled
+            self.navImg.processH5Button.setChecked(False)
+            self.navFit.processH5Button.setChecked(False)
+        
 
-            # Display progress bar
-            self.progressBar.setMaximum(nImg)
-            self.progressBar.setMinimum(0)
-            self.progressBar.setVisible(True)
+    def stopProcess(self):
+        """
+        Stop the process
+        """
+        self.stop_process = True
+        if self.processExecutor:
+            self.processExecutor.shutdown(wait=False, cancel_futures=True)
+        running_count = self.taskManager.get_running_count()
 
-            ## Process all images and update progress bar
-            self.in_batch_process = True
-            self.stop_process = False
-            for _ in range(len(self.h5List)):
-                for i in range(nImg):
-                    if self.stop_process:
-                        break
-                    self.progressBar.setValue(i)
-                    QApplication.processEvents()
-                    self.nextImageFitting(True)
-                if self.stop_process:
-                    break
-                self.nextFileClicked()
-            self.in_batch_process = False
+        # Use QProgressDialog with indeterminate progress (no progress bar)
+        msg = f"Stopping Batch Processing\n\nWaiting for {running_count} tasks to complete..."
+        self._stopProgress = QProgressDialog(msg, None, 0, 0, self)
+        self._stopProgress.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self._stopProgress.setModal(False)
+        self._stopProgress.show()
 
-        self.progressBar.setVisible(False)
-        self.processH5FolderButton.setChecked(False)
-        self.processH5FolderButton.setText("Reprocess and Refit All H5 Files")
-        self.processH5FolderButton2.setChecked(False)
-        self.processH5FolderButton2.setText("Reprocess and Refit All H5 Files")
+        self._stopMsgTimer = QTimer(self)
+        self._stopMsgTimer.setInterval(300)
+        self._stopMsgTimer.timeout.connect(self._updateStopProgress)
+        self._stopMsgTimer.start()
+        
+        
+        
+    def _updateStopProgress(self):
+        if not hasattr(self, '_stopProgress') or self._stopProgress is None:
+            return
+        running_count = self.taskManager.get_running_count()
+        
+        # Update the message text only
+        msg = f"Stopping Batch Processing\n\nWaiting for {running_count} tasks to complete..."
+        self._stopProgress.setLabelText(msg)
+        
+        if running_count == 0:
+            self._stopMsgTimer.stop()
+            self._stopProgress.close()
+            self._cleanupAfterBatch()
+        
+            if getattr(self, '_closingAfterStop', False):
+                self._closingAfterStop = False
+                QTimer.singleShot(0, self.close)
+
+
 
     def setCalibrationImage(self, force=False):
         """
@@ -2046,7 +2186,7 @@ class EquatorWindow(QMainWindow):
         """
         Going to the previous image
         """
-        self.currentImg = (self.currentImg - 1) % len(self.imgList)
+        self.file_manager.prev_frame()
         self.onImageChanged()
 
     def nextImageFitting(self, reprocess):
@@ -2054,20 +2194,11 @@ class EquatorWindow(QMainWindow):
         Used for processing of a folder to process the next image
         :param reprocess (bool): boolean telling if we need to reprocess the image or not
         """
-        self.currentImg = (self.currentImg + 1) % len(self.imgList)
-
-        fileName = self.imgList[self.currentImg]
-        self.filenameLineEdit.setText(fileName)
-        self.filenameLineEdit2.setText(fileName)
-        try:
-            self.bioImg = EquatorImage(self.dir_path, fileName, self, self.fileList, self.ext)
-        except Exception as e:
-            infMsg = QMessageBox()
-            infMsg.setText("Error trying to open " + str(fileName))
-            infMsg.setInformativeText("This usually means that the image is corrupted or missing.  Skipping this image.")
-            infMsg.setStandardButtons(QMessageBox.Ok)
-            infMsg.setIcon(QMessageBox.Information)
-            infMsg.exec_()
+        self.file_manager.next_frame()
+        fileName = self.file_manager.current_image_name
+        self.navImg.filenameLineEdit.setText(fileName)
+        self.navFit.filenameLineEdit.setText(fileName)
+        self.bioImg = EquatorImage(self.file_manager.current_image, self.file_manager.dir_path, fileName, self)
         if reprocess:
             self.refreshProcessingParams()
         self.bioImg.skeletalVarsNotSet = not ('isSkeletal' in self.bioImg.info and self.bioImg.info['isSkeletal'])
@@ -2096,53 +2227,43 @@ class EquatorWindow(QMainWindow):
         """
         Going to the next image
         """
-        self.currentImg = (self.currentImg + 1) % len(self.imgList)
+        self.file_manager.next_frame()
         self.onImageChanged()
 
     def prevFileClicked(self):
         """
         Going to the previous h5 file
         """
-        if len(self.h5List) > 1:
-            self.h5index = (self.h5index - 1) % len(self.h5List)
-            self.dir_path, self.imgList, self.currentImg, self.fileList, self.ext = getImgFiles(os.path.join(self.dir_path, self.h5List[self.h5index]))
-            self.onImageChanged()
+        self.file_manager.prev_file
+        self.onImageChanged()
 
     def nextFileClicked(self):
         """
         Going to the next h5 file
         """
-        if len(self.h5List) > 1:
-            self.h5index = (self.h5index + 1) % len(self.h5List)
-            self.dir_path, self.imgList, self.currentImg, self.fileList, self.ext = getImgFiles(os.path.join(self.dir_path, self.h5List[self.h5index]))
-            self.onImageChanged()
+        self.file_manager.next_file
+        self.onImageChanged()
 
-    def setH5Mode(self, file_name):
+    def setH5Mode(self):
         """
         Sets the H5 list of file and displays the right set of buttons depending on the file selected
         """
-        if self.ext in ['.h5', '.hdf5']:
-            for file in os.listdir(self.dir_path):
-                if file.endswith(".h5") or file.endswith(".hdf5"):
-                    self.h5List.append(file)
-            self.h5index = self.h5List.index(os.path.split(file_name)[1])
-            self.nextFileButton.show()
-            self.prevFileButton.show()
-            self.nextFileButton2.show()
-            self.prevFileButton2.show()
-            self.processH5FolderButton.show()
-            self.processH5FolderButton2.show()
-            self.processFolderButton.setText("Process Current H5 File")
-            self.processFolderButton2.setText("Process Current H5 File")
+        if self.file_manager.current_file_type == 'h5':
+            self.navImg.nextFileButton.show()
+            self.navImg.prevFileButton.show()
+            self.navFit.nextFileButton.show()
+            self.navFit.prevFileButton.show()
+            self.navImg.processH5Button.show()
+            self.navFit.processH5Button.show()
+
         else:
-            self.nextFileButton.hide()
-            self.prevFileButton.hide()
-            self.nextFileButton2.hide()
-            self.prevFileButton2.hide()
-            self.processH5FolderButton.hide()
-            self.processH5FolderButton2.hide()
-            self.processFolderButton.setText("Process Current Folder")
-            self.processFolderButton2.setText("Process Current Folder")
+            self.navImg.nextFileButton.hide()
+            self.navImg.prevFileButton.hide()
+            self.navFit.nextFileButton.hide()
+            self.navFit.prevFileButton.hide()
+            self.navImg.processH5Button.hide()
+            self.navFit.processH5Button.hide()
+
 
     def fileNameChanged(self):
         """
@@ -2150,12 +2271,12 @@ class EquatorWindow(QMainWindow):
         """
         selected_tab = self.tabWidget.currentIndex()
         if selected_tab == 0:
-            fileName = str(self.filenameLineEdit.text()).strip()
+            fileName = str(self.navImg.filenameLineEdit.text()).strip()
         elif selected_tab == 1:
-            fileName = str(self.filenameLineEdit2.text()).strip()
-        if fileName not in self.imgList:
+            fileName = str(self.navFit.filenameLineEdit.text()).strip()
+        if fileName not in self.file_manager.names:
             return
-        self.currentImg = self.imgList.index(fileName)
+        self.file_manager.switch_image_by_name(fileName)
         self.onImageChanged()
 
     def keyPressEvent(self, event):
@@ -2559,9 +2680,10 @@ class EquatorWindow(QMainWindow):
             return self.modeOrientation
         print("Calculating mode of angles of images in directory")
         angles = []
-        for f in self.imgList:
-            bioImg = EquatorImage(self.dir_path, f, self, self.fileList, self.ext)
-            print(f'Getting angle {f}')
+        for idx, filename in enumerate(self.file_manager.names):
+
+            bioImg = EquatorImage(self.file_manager.get_image_by_index(idx), self.file_manager.dir_path, filename, self)
+            print(f'Getting angle {filename}')
 
             if 'rotationAngle' not in bioImg.info:
                 return None
@@ -3229,11 +3351,37 @@ class EquatorWindow(QMainWindow):
         """
         Trigger when window is closed
         """
+        if hasattr(self, 'taskManager') and self.taskManager.get_running_count() > 0:
+            # Show confirmation dialog
+            reply = QMessageBox.question(
+                self,
+                'Confirm Close',
+                'Tasks are currently running. Are you sure you want to close and stop all tasks?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                ev.ignore()
+                if not getattr(self, '_closingAfterStop', False):
+                    self._closingAfterStop = True
+                    self.stopProcess()
+            else:
+                ev.ignore()
+            return
+
+        
+        
         # delete window object from main window
         if self.logger is not None:
             self.logger.popup()
             self.logger.close()
-        self.mainWindow.childWindowClosed(self)
+
+        if not getattr(self, "_notifiedParentClosed", False):
+            self._notifiedParentClosed = True
+            self.mainWindow.childWindowClosed(self)
+        
+        super().closeEvent(ev)
 
     def initWidgets(self, info):
         """
@@ -3308,48 +3456,70 @@ class EquatorWindow(QMainWindow):
 
         self.syncUI = False
 
-    def onImageChanged(self):
+    def onImageChanged(self, first_run=False):
         """
-        Need to be called when image is change i.e. to the next image.
-        This will create a new EquatorImage object for the new image and syncUI if cache is available
-        Process the new image if there's no cache.
+        Called when image changes (including initial load).
+        Creates a new EquatorImage object and processes it.
+        
+        :param first_run: True if this is the initial image load in __init__
         """
-        if self.fixedFittingParamChanged(self.getSettings()):
+        # Skip refitting check on first run
+        if not first_run and self.fixedFittingParamChanged(self.getSettings()):
             print("Refitting current image first")
             self.refitting()
 
-        fileName = self.imgList[self.currentImg]
-        self.filenameLineEdit.setText(fileName)
-        self.filenameLineEdit2.setText(fileName)
-        # prevInfo = self.bioImg.info if self.bioImg is not None else None
-        self.bioImg = EquatorImage(self.dir_path, fileName, self, self.fileList, self.ext)
+        # Update UI with current filename
+        fileName = self.file_manager.current_image_name
+        self.navImg.filenameLineEdit.setText(fileName)
+        self.navFit.filenameLineEdit.setText(fileName)
+
+        # Create EquatorImage
+        self.bioImg = EquatorImage(
+            self.file_manager.current_image, 
+            self.file_manager.dir_path, 
+            self.file_manager.current_image_name, 
+            self
+        )
         self.bioImg.skeletalVarsNotSet = not ('isSkeletal' in self.bioImg.info and self.bioImg.info['isSkeletal'])
         self.bioImg.extraPeakVarsNotSet = not ('isExtraPeak' in self.bioImg.info and self.bioImg.info['isExtraPeak'])
-        settings = None
-        if len(self.bioImg.info) < 2: # use settings of the previous image
+        
+        # First-run specific setup
+        if first_run:
+            if 'paramInfo' in self.bioImg.info:
+                self.k_chkbx.setChecked(self.bioImg.info['paramInfo']['k']['fixed'])
+            self.calSettings = None
+        
+        # Prepare settings
+        if first_run:
+            settings = self.getSettings(first_run=(True if 'model' not in self.bioImg.info else False))
+            settings.update(self.bioImg.info)
+        elif len(self.bioImg.info) < 2:
             settings = self.getSettings()
-            print("Settings in onImageChange before update")
-            print(settings)
             settings.update(self.bioImg.info)
         else:
             settings = self.bioImg.info
+        
+        # Initialize UI widgets
         self.initWidgets(settings)
         self.initMinMaxIntensities(self.bioImg)
         self.img_zoom = None
         self.refreshStatusbar()
-
-        # if self.fixedParamChanged(prevInfo):
-        #     print("Refitting next image")
-        #     self.refreshAllFittingParams()
-
-        if self.use_previous_fit_chkbx.isChecked():
+        
+        # First-run specific setup
+        if first_run:
+            self.setCalibrationImage()  # Must be after initWidgets
+            self.setH5Mode()
+            self.initProcessExecutor()
+            self.uiUpdateTimer.start()
+        
+        # Process image
+        if not first_run and self.use_previous_fit_chkbx.isChecked():
             print("Using previous fit")
             ret = self.updateFittingParamsInParamInfo()
             if ret == -1:
                 return
             self.processImage(self.bioImg.info['paramInfo'])
         else:
-            # Process new image
             self.processImage()
 
     def fixedParamChanged(self, prevInfo):
@@ -3594,48 +3764,157 @@ class EquatorWindow(QMainWindow):
         self.tasksQueue.put((self.bioImg, self.getSettings(), paramInfo))
         
         # If there's no task currently running, start the next task
-        if self.currentTask is None:
-            self.startNextTask()
+        self.startNextTask()
             
     def thread_done(self, bioImg):
         self.tasksDone += 1
-        self.progressBar.setValue(100. / len(self.imgList) * self.tasksDone)
-        #self.refreshStatusbar()
-        self.bioImg = bioImg
+        self.progressBar.setValue(100. / len(self.file_manager.names) * self.tasksDone)
+        # Store finished image for onProcessingFinished; do not switch context here
+        self._finishedBioImg = bioImg
         print("thread done")
                     
     def startNextTask(self):
-        if not self.tasksQueue.empty():
+        # Launch up to a safe concurrency limit to keep UI responsive
+        limit = max(1, self.threadPool.maxThreadCount() // 2)
+        started_any = False
+        while not self.tasksQueue.empty() and self.threadPool.activeThreadCount() < limit:
             print("starting new task")
             bioImg, settings, paramInfo = self.tasksQueue.get()
-            
-            if settings['find_oritation']:
+
+            if settings.get('find_oritation'):
                 self.brightSpotClicked()
 
-            self.currentTask = Worker(bioImg, settings, paramInfo)
-            self.currentTask.signals.result.connect(self.thread_done)
-            self.currentTask.signals.finished.connect(self.onProcessingFinished)
-            self.threadPool.start(self.currentTask)
-        else:
+            worker = Worker(bioImg, settings, paramInfo)
+            worker.signals.result.connect(self.thread_done)
+            worker.signals.finished.connect(self.onProcessingFinished)
+            self.threadPool.start(worker)
+            self.currentTask = worker
+            started_any = True
+
+        if not started_any and self.tasksQueue.empty() and self.threadPool.activeThreadCount() == 0:
             self.progressBar.setVisible(False)
         
-    def onProcessingFinished(self):
+    def onProcessingFinished(self, finishedImg):
+        # Temporarily switch context to the finished image to update outputs
+        prevBio = self.bioImg
+        self.bioImg = finishedImg
         self.updateParams()
-        self.csvManager.writeNewData(self.bioImg)
-        self.csvManager.writeNewData2(self.bioImg)
+        self.csvManager.writeNewData(finishedImg)
+        self.csvManager.writeNewData2(finishedImg)
         self.resetUI()
         self.refreshStatusbar()
         self.quadrantFoldCheckbx.setChecked(self.bioImg.quadrant_folded)
         QApplication.restoreOverrideCursor()
         self.tabWidget.tabBar().setEnabled(True)
         self.tabWidget.tabBar().setToolTip("")
-        
         self.currentTask = None
+        # Restore previous reference so batch refitting continues to target the UI's current file
+        self.bioImg = prevBio
         if self.first:
             self.init_logging()
             self.first = False
         else:
             self.startNextTask()
+
+    def _onFutureDone(self, future):
+        """Dispatch onImageProcessed to main thread safely."""
+        QTimer.singleShot(0, self, lambda: self.onImageProcessed(future))
+
+    def onImageProcessed(self, future):
+        """
+        Callback when image processing completes.
+        Runs in main thread via Qt's callback mechanism.
+        """
+        try:
+            # Retrieve result from future
+            result = future.result()
+            error = result.get('error')
+            
+            # Organize result via task manager
+            task = self.taskManager.complete_task(future, result, error)
+            
+            if not task:
+                return
+            
+            if error:
+                print(f"Error processing {task.filename}: {error}")
+            else:
+                # Save results to disk (main thread only)
+                self._organizeAndSaveResult(task)
+            
+            # Queue UI update (will be processed in order)
+            self.pendingUIUpdates[task.job_index] = task
+            
+        except Exception as e:
+            print(f"Callback error: {e}")
+            traceback.print_exc()
+    
+    def _organizeAndSaveResult(self, task):
+        """
+        Organize and persist processing results.
+        ALWAYS runs in main thread - safe for file I/O.
+        """
+        result = task.result
+        filename = task.filename
+        
+        # Get the correct image for this task
+        img = self.file_manager.get_image_by_index(task.job_index)
+        
+        # Create EquatorImage with correct filename from task
+        bioImg = EquatorImage(img, self.file_manager.dir_path, filename, self)
+        bioImg.info = result['info']
+        
+        # Write cache (main thread only)
+        try:
+            bioImg.saveCache()
+        except Exception as e:
+            print(f"Failed to save cache for {filename}: {e}")
+        
+        # Write CSV (main thread only)
+        try:
+            self.csvManager.writeNewData(bioImg)
+            self.csvManager.writeNewData2(bioImg)
+        except Exception as e:
+            print(f"Failed to write CSV for {filename}: {e}")
+        
+        # Explicitly delete large objects to ensure immediate memory release
+        del img
+        del bioImg
+        
+        # Force garbage collection every 10 images to prevent memory accumulation
+        stats = self.taskManager.get_statistics()
+        if stats['completed'] % 10 == 0:
+            import gc
+            collected = gc.collect()
+            print(f"[GC] Collected {collected} objects after {stats['completed']} images")
+        
+        print(f"✓ Completed {filename} in {task.processing_time:.2f}s")
+    
+    def _processImageFallback(self, paramInfo=None):
+        """Fallback to thread-based processing if multiprocessing fails"""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        settings = self.getSettings()
+        
+        try:
+            self.bioImg.process(settings, paramInfo)
+            self.updateParams()
+            self.csvManager.writeNewData(self.bioImg)
+            self.csvManager.writeNewData2(self.bioImg)
+            self.resetUI()
+            self.refreshStatusbar()
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            errMsg = QMessageBox()
+            errMsg.setText('Unexpected error')
+            errMsg.setInformativeText(str(e))
+            errMsg.setStandardButtons(QMessageBox.Ok)
+            errMsg.setIcon(QMessageBox.Warning)
+            errMsg.exec_()
+            raise
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.tabWidget.tabBar().setEnabled(True)
 
     def setLeftStatus(self, s):
         """
@@ -3666,8 +3945,9 @@ class EquatorWindow(QMainWindow):
         """
         if self.bioImg is None:
             return
+        total = str(len(self.file_manager.names)) + ('*' if self._provisionalCount else '')
         self.setLeftStatus(
-            "(" + str(self.currentImg + 1) + "/" + str(len(self.imgList)) + ") " + fullPath(self.dir_path,
+            "(" + str(self.file_manager.current + 1) + "/" + total + ") " + fullPath(self.dir_path,
                                                                                             self.bioImg.filename))
         img = self.bioImg.orig_img
         self.right_status.setText(str(img.shape[0]) + "x" + str(img.shape[1]) + " " + str(img.dtype))
@@ -3698,7 +3978,9 @@ class EquatorWindow(QMainWindow):
                 else:
                     settings["lambda_sdd"] = 1. * self.calSettings["lambda"] * self.calSettings["sdd"] / self.calSettings[
                         "pixel_size"]
-            if "center" in self.calSettings and self.calibSettingDialog.fixedCenter.isChecked():
+            # Always save calibrated center if available
+            # Whether to USE it is controlled by Persistent Center in main GUI
+            if "center" in self.calSettings:
                 settings["calib_center"] = self.calSettings["center"]
             if "detector" in self.calSettings and self.calibSettingDialog.manDetector.isChecked():
                 settings["detector"] = self.calSettings["detector"]
@@ -3749,8 +4031,18 @@ class EquatorWindow(QMainWindow):
         self.syncUI = True
         min_val = img.min()
         max_val = img.max()
-        self.minIntSpnBx.setRange(min_val, max_val)
-        self.maxIntSpnBx.setRange(min_val, max_val)
+        
+        if not self.persistIntensity.isChecked():
+            # Only update values when NOT persisting (range is already set to allow any value)
+            # use cached values if they're available, otherwise use defaults
+            if "minInt" in self.bioImg.info and "maxInt" in self.bioImg.info:
+                self.minIntSpnBx.setValue(self.bioImg.info["minInt"])
+                self.maxIntSpnBx.setValue(self.bioImg.info["maxInt"])
+            else:
+                self.minIntSpnBx.setValue(min_val)
+                self.maxIntSpnBx.setValue(max_val * 0.20)
+        # When persist is checked: don't touch range or values at all
+        
         self.minIntLabel.setText("Min Intensity ("+str(min_val)+")")
         self.maxIntLabel.setText("Max Intensity ("+str(max_val)+")")
         step = (max_val - min_val) * 0.07  # set spinboxes step as 7% of image range
@@ -3760,13 +4052,6 @@ class EquatorWindow(QMainWindow):
         self.minIntSpnBx.setDecimals(2)
         self.maxIntSpnBx.setDecimals(2)
 
-        # use cached values if they're available
-        if "minInt" in self.bioImg.info and "maxInt" in self.bioImg.info:
-            self.minIntSpnBx.setValue(self.bioImg.info["minInt"])
-            self.maxIntSpnBx.setValue(self.bioImg.info["maxInt"])
-        elif not self.persistIntensity.isChecked():
-            self.minIntSpnBx.setValue(min_val)
-            self.maxIntSpnBx.setValue(max_val * 0.20)
         self.syncUI = False
         
 

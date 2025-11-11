@@ -7,3 +7,16 @@ musclex/tests/di/*
 musclex/tests/eq/*
 musclex/tests/pt/*
 musclex/tests/qf/*
+musclex/tests/test_guide/
+musclex/tests/test_logs/test.log
+/venv/
+.idea/
+/venv/
+/temp_files/
+/docs/_build/
+
+# Pycharm
+.idea/
+
+.DS_Store
+

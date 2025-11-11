@@ -80,7 +80,6 @@ class PT_CSVManager:
                 self.colnames.append ("Box " + str(box_name) + " Background Amplitude")
                 self.colnames.append ("Box " + str(box_name) + " Meridian Background Sigma")
                 self.colnames.append ("Box " + str(box_name) + " Meridian Background Amplitude")
-                self.colnames.append ("Box " + str(box_name) + " Meridian Sigma")
                 self.colnames.append ("Box " + str(box_name) + " Meridian Amplitude")
                 self.colnames.append("Box " + str(box_name) + " error")
                 self.colnames.append("Box " + str(box_name) + " comments")
